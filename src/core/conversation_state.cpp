@@ -739,20 +739,24 @@ bool conversation_snapshot_sources_split(SavedConversation& meta, std::vector<Se
         const OnDevice on_main(devices[0]);
         if (!sync(error)) return false;
         if (!conversation_checkpoint_save(captured.live, *sessions[0], g, error)) return false;
+        conversation_checkpoint_join(captured.live.gdn.data());   // STRATA_CKPT_ASYNC: the running state lands on a
+                                                                  // background CPU thread; mirror the single-device builder
     }
     size_t total = 0;
     for (size_t k = 0; k < sessions.size(); ++k) total += owned_qsa(*sessions[k]) + (draft_of[k] ? 1 : 0);
     std::vector<SessionKvSource> out(total);
     const int64_t upto = (int64_t) view.ids.size();
     size_t at = 0;
-    // The later stages' parts, each on its own device: that stage is quiesced before its capture, so its copies
-    // ride the owning device's private stream and a pending kernel cannot leave a torn stage in the file.
+    // The later stages' parts, each on its own device: that stage is quiesced before its capture, so its device-side
+    // copies cannot leave a torn stage; the join below covers the CPU side (STRATA_CKPT_ASYNC lands the GDN bytes on a
+    // background thread a device sync does not wait for), so nothing is still pending when the file write reads them.
     for (size_t k = 1; k < sessions.size(); ++k) {
         const OnDevice on(devices[k]);
         if (!sync(error)) return false;
         ConversationCheckpoint part;
         part.ids = view.ids; part.imgs = view.images;
         if (!conversation_checkpoint_save(part, *sessions[k], g, error)) return false;
+        conversation_checkpoint_join(part.gdn.data());   // STRATA_CKPT_ASYNC (join before the part moves)
         captured.live.stage_parts.push_back(std::move(part));
     }
     // The K/V sources are lazy: their reads happen during the file write and ride each pool's own device
