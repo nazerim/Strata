@@ -13783,7 +13783,29 @@ int main(int argc, char** argv) {
                         ++written;
                     }
                     if (failed) continue;   // the old manifest (if any) still lists only files that were not touched
+                    // The live cache is not the truth about the disk: RAM admission and the byte budget are
+                    // transient, and one evict-then-refuse (an image that needed room it never got) can empty
+                    // the cache minutes before a graceful stop - deleting an evicted conversation's file then
+                    // turned a momentary squeeze into the permanent loss of the restart survival the park is
+                    // for (seen in the field: `evicted 1, 0 still parked` one minute before a stop that wrote
+                    // 0 conversations and swept 4 files). Files the old manifest still lists young therefore
+                    // survive, re-listed so the next boot reads them back; age alone removes them.
+                    std::set<std::string> keep;
+                    std::string keep_list;
+                    if (!ramlike) {
+                        std::ifstream mf(manifest, std::ios::binary);
+                        std::string mw;
+                        while (mf && (mf >> mw) && mw != "end") {
+                            if (mw != "conv") continue;
+                            std::string name; long long tk = 0, pk = 0;
+                            if (!(mf >> name >> tk >> pk)) break;
+                            if (too_old(pk) || used.count(name) != 0) continue;
+                            keep.insert(name);
+                            keep_list += "conv " + name + " " + std::to_string(tk) + " " + std::to_string(pk) + "\n";
+                        }
+                    }
                     std::string list;
+                    list += keep_list;
                     for (const auto& p : picks) {
                         const auto& e = all[p.i];
                         list += "conv " + p.name + " " + std::to_string(e.live.ids.size()) + " " +
@@ -13823,17 +13845,19 @@ int main(int argc, char** argv) {
                         const std::string fname = de.path().filename().string();
                         if (fname.size() < 4 || fname.compare(fname.size() - 4, 4, ".ses") != 0) continue;
                         const size_t cut = fname.rfind("-s");
-                        if (cut != std::string::npos && used.count(fname.substr(0, cut)) != 0) continue;
+                        if (cut != std::string::npos &&
+                            (used.count(fname.substr(0, cut)) != 0 || keep.count(fname.substr(0, cut)) != 0)) continue;
                         std::error_code rc;
                         if (std::filesystem::remove(de.path(), rc)) ++removed;
                     }
                     std::fprintf(stderr, "strata serve: park save%s: %zu conversation%s on disk (%zu written now, %zu bytes; "
                                  "%zu already there), %zu bytes in all; not kept: %zu under %lld tokens, %zu older than "
-                                 "%lld h%s; %zu old files removed; %.1f ms (tag %s)\n",
+                                 "%lld h%s; %zu old files removed, %zu kept from an older manifest; %.1f ms (tag %s)\n",
                                  ramlike ? " (RAM-like: named sections, nothing on disk but the manifest)" : "",
                                  picks.size(), picks.size() == 1 ? "" : "s", written, bytes_written,
                                  picks.size() - written, kept_bytes, small, (long long) min_tokens, old,
-                                 (long long) (max_age_s / 3600), odd ? ", some without every stage" : "", removed, ms(),
+                                 (long long) (max_age_s / 3600), odd ? ", some without every stage" : "", removed,
+                                 keep.size(), ms(),
                                  tag.c_str());
                     std::printf("SAVED %zu %zu %.1f\n", picks.size(), bytes_written, ms());
                 } else {
@@ -13889,6 +13913,11 @@ int main(int argc, char** argv) {
                             }
                     const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                     size_t loaded = 0, aged = 0, bytes_all = 0;
+                    // the cache never prints its own removals: count what the load's own puts evict or
+                    // supersede (put drops older copies whose deepest checkpoint the new image holds - with
+                    // PARKSAVE's {shallowest, deepest} truncation two sibling branches can share a chain,
+                    // and the one read second silently wins) so the summary line below can never be a lie
+                    const size_t ev0 = conversations.evictions(), su0 = conversations.superseded();
                     for (size_t i = 0; i < convs.size(); ++i) {
                         if (too_old(convs[i].parked)) { ++aged; continue; }
                         strata::core::SavedConversation image;
@@ -13947,9 +13976,13 @@ int main(int argc, char** argv) {
                         bytes_all += conv_bytes;
                     }
                     std::fprintf(stderr, "strata serve: park load: %zu of %zu parked conversation%s, %zu bytes from %s in "
-                                 "%.1f ms (%zu older than %lld h left out); parked=%zu bytes=%zu\n", loaded, convs.size(),
+                                 "%.1f ms (%zu older than %lld h left out); parked=%zu bytes=%zu%s%s\n", loaded, convs.size(),
                                  convs.size() == 1 ? "" : "s", bytes_all, dir.c_str(), ms(), aged,
-                                 (long long) (max_age_s / 3600), conversations.size(), conversations.bytes());
+                                 (long long) (max_age_s / 3600), conversations.size(), conversations.bytes(),
+                                 conversations.evictions() > ev0 || conversations.superseded() > su0 ? "; the load itself" : "",
+                                 conversations.evictions() > ev0 || conversations.superseded() > su0
+                                     ? (std::to_string(conversations.evictions() - ev0) + " evicted, " +
+                                        std::to_string(conversations.superseded() - su0) + " superseded").c_str() : "");
                     std::printf("RESTORED %zu %zu %.1f\n", loaded, bytes_all, ms());
                 }
                 std::fflush(stdout);
@@ -14626,8 +14659,16 @@ int main(int argc, char** argv) {
             // start of this prompt wins as before)
             bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
                           conversations.borrows(parked);
-            if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
+            if (parked.tokens > std::max(resume, slot_tokens) && !borrow) {
                 incoming.emplace(conversations.take(parked.index));
+                // a layer split has no borrow: taking is how a parked conversation is restored, and until this
+                // line printed nothing said the cache just lost an entry - a request's own park line below it
+                // then read like a silent disappearance (seen in the field: parked=2 at boot, this request's
+                // "skip parking (...; parked=1)" before the very next line restored from the taken copy)
+                std::fprintf(stderr, "strata serve: conversation cache: took the parked conversation (%lld tokens) "
+                                     "to start this request; parked=%zu\n", (long long) parked.tokens,
+                             conversations.size());
+            }
             if (incoming || borrow) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
