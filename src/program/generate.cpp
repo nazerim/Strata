@@ -15040,6 +15040,61 @@ int main(int argc, char** argv) {
                         std::error_code ec;
                         std::filesystem::create_directories(spill_dir, ec);
                         if (ec) { err = "cannot create " + spill_dir + ": " + ec.message(); return false; }
+                        // endurance (v1.2): the name IS the hash of the conversation's token ids and length, so a
+                        // same-name set already on disk holds provably the same bytes the write would produce -
+                        // re-stamp the manifest line (age freshness) and skip the GBs. Every-refusal rewrite of a
+                        // 5 GiB stage pair was the one thing an alternating long-session workload would notice.
+                        {
+                            std::ifstream probe(spill_dir + "/" + name_out + "-s0.ses", std::ios::binary);
+                            std::ifstream probe_last(spill_dir + "/" + name_out + "-s" + std::to_string(stages.size()) + ".ses", std::ios::binary);
+                            bool line_there = false;
+                            { std::ifstream mf(spill_dir + "/park.manifest", std::ios::binary); std::string w;
+                              while (mf >> w) { if (w == "end") break;
+                                  if (w == "conv") { std::string nm; long long tk, pk; if (mf >> nm >> tk >> pk && nm == name_out) line_there = true; }
+                                  else mf.seekg(0, std::ios::cur); } }
+                            if (probe && probe_last && line_there) {
+                                // re-stamp only: rewrite the manifest with this line's parked time = now
+                                const int64_t now_s = (int64_t) std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count();
+                                std::string list; bool kept = false;
+                                std::ifstream mf(spill_dir + "/park.manifest", std::ios::binary);
+                                std::string w; int fmt = 0; std::string mt; bool ok_fmt = false, ok_tag = false;
+                                std::vector<std::string> others;
+                                while (mf >> w) {
+                                    if (w == "strata-park") { mf >> fmt; ok_fmt = (fmt == 2); continue; }
+                                    if (w == "tag") { mf >> mt; ok_tag = (mt == spill_tag); continue; }
+                                    if (w == "stages") { int sn = 0; mf >> sn; continue; }
+                                    if (w == "conv") { std::string nm; long long tk = 0, pk = 0; if (!(mf >> nm >> tk >> pk)) break;
+                                        std::ostringstream ol;
+                                        if (nm == name_out) { kept = true; ol << "conv " << nm << " " << tk << " " << now_s << "\n"; }
+                                        else ol << "conv " << nm << " " << tk << " " << pk << "\n";
+                                        others.push_back(ol.str()); continue; }
+                                    if (w == "end") break;
+                                    ok_fmt = false; break;
+                                }
+                                if (ok_fmt && ok_tag && kept) {
+                                    for (const auto& o : others) list += o;
+                                    // 'list' already carries the re-stamped line (kept==true above)
+                                    const std::string tmp = spill_dir + "/park.manifest.tmp";
+                                    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+                                    f << "strata-park 2\ntag " << spill_tag << "\nstages " << (stages.size() + 1) << "\n" << list << "end\n";
+                                    f.close();
+                                    if (f) {
+#ifndef _WIN32
+                                        { int fd = ::open(tmp.c_str(), O_RDONLY); if (fd >= 0) { (void) ::fsync(fd); ::close(fd); } }
+#endif
+                                        std::error_code ec2; std::filesystem::rename(tmp, spill_dir + "/park.manifest", ec2);
+                                        if (!ec2) {
+#ifndef _WIN32
+                                            { int dfd = ::open(spill_dir.c_str(), O_RDONLY); if (dfd >= 0) { (void) ::fsync(dfd); ::close(dfd); } }
+#endif
+                                            name_out += " (re-stamped, bytes unchanged)";
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         strata::core::SessionFileIdentity sid;
                         if (!session_identity(sid, err, std::function<void()>())) return false;
                         // the same truncation the walk writes: shallowest + deepest when the stage lists line up
