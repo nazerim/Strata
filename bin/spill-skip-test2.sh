@@ -20,6 +20,7 @@ KEY=$(awk '{print $1}' /mnt/scratch/naz/models/.llama/api_keys | head -c 64)
 URL=http://127.0.0.1:8001/v1/chat/completions
 R=/tmp/opencode/spill-test; mkdir -p $R
 SNAP=$R/mtimes.txt
+PREV=
 
 turn(){ local salt=$1 code=$2 tag=$3
   python3 - "$salt" "$code" "$R" <<'PY'
@@ -32,7 +33,9 @@ json.dump({"model":"strata","messages":[{"role":"user","content":text}],"max_tok
 PY
   curl -s -m 1200 -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' "$URL" --data-binary @"$R/body_sk2.json" \
     | python3 -c "import json,sys;d=json.load(sys.stdin);c=(d['choices'][0]['message']['content'] or '')[:40];print('  turn $tag ->',c)" 2>/dev/null
-  bootline | grep -a 'spilled' | tail -1 | grep -oE 'as [a-z0-9-]+( \([^)]*\))?' | sed "s/^/$(date +%s)|$tag|/" >> $SNAP || true
+  # record ONLY a spill line NEWER than this turn started would have seen: count deltas, not the tail
+  local NOW=$(bootline | grep -ac 'spilled')
+  if [ "$NOW" != "${PREV:-}" ]; then bootline | grep -a 'spilled' | tail -1 | grep -oE 'as [a-z0-9-]+( \([^)]*\))?' | sed "s/^/$(date +%s)|$tag|/" >> $SNAP; PREV=$NOW; fi
   for f in $PARK/*-s0.ses; do [ -e "$f" ] && echo "$(date +%s)|$tag|$(basename $f)|$(stat -c %Y $f)" >> ${SNAP}m; done
 }
 bootline(){ tail -n +$(grep -an 'engine started' $L | tail -1 | cut -d: -f1) $L; }
