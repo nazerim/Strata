@@ -767,5 +767,23 @@ int main() {
         check(cache.put(std::move(other)) && cache.size() == 1 && cache.superseded() == 1,
               "the second silently supersedes the first - the live tail is lost (the documented hazard)");
     }
+    {
+        // stop-time eviction protection (found by the P5 assertion, park-spill v1.1): when the save walk's own
+        // live-park asks for room, entries the disk does not hold yet must survive it - evicting an unsaved one
+        // to admit the live image is how C died silently at the stop in the first P5 run. Mid-run keeps its LRU.
+        ConversationCache cache(1u << 24, 1);   // one slot: the second image must evict the first or refuse
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        SavedConversation a = image({1, 2, 3, 4}); a.checkpoints = {cp({1, 2})};
+        SavedConversation b = image({1, 2, 3, 5, 6}); b.checkpoints = {cp({1, 2})};
+        check(cache.put(std::move(a)), "unsaved entry parked");
+        check(!cache.make_room(b.bytes(), 0, true), "stop-context room is refused while the only entry is unsaved");
+        check(cache.size() == 1, "the unsaved entry survived the stop-context attempt");
+        check(cache.make_room(b.bytes(), 0, false), "mid-run room may still evict it (LRU unchanged)");
+        check(cache.size() == 0, "and it went, as the request path does today");
+        SavedConversation saved = image({9, 8, 7}); saved.checkpoints = {cp({9})}; saved.disk_name = "c9-3";
+        check(cache.put(std::move(saved)), "disk-held entry parked");
+        SavedConversation c2 = image({9, 8, 7, 6, 5}); c2.checkpoints = {cp({9})};
+        check(cache.make_room(c2.bytes(), 0, true), "a disk-held entry IS evictable even stop-context");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
