@@ -13676,6 +13676,10 @@ int main(int argc, char** argv) {
         // the boot PARKLOAD attempts it through the usual validation and admission - a too-big-for-RAM entry
         // simply stays durable on disk instead of vanishing at the stop.
         std::function<bool(strata::core::SavedConversation&, std::string& name_out)> park_spill_fn;
+        // set while PARKSAVE's own live-park runs: make_room/evict_oldest then take only entries the disk already
+        // holds, so capturing a big live conversation can never evict an unsaved parked one (the stop-path eviction
+        // bug the P5 assertion caught: E's admission destroyed C before the walk could write it)
+        bool park_stop_context = false;
         auto park_source = [&](const ParkSource& src, size_t held) -> bool {
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
@@ -13778,7 +13782,7 @@ int main(int argc, char** argv) {
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
             bool spill_instead = false;   // park-spill: capture runs, the image goes to the disk, never to the cache
-            if (!conversations.make_room(estimate, held)) {
+            if (!conversations.make_room(estimate, held, park_stop_context)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
                 if (!park_spill_fn) return true;
@@ -13828,7 +13832,7 @@ int main(int argc, char** argv) {
                             admit, [&] { return mem ? std::optional<uint64_t>(mem->available) : std::nullopt; },
                             [&]() -> size_t {
                                 const size_t b = conversations.oldest_evictable_bytes();
-                                if (b == 0 || !conversations.evict_oldest()) return 0;
+                                if (b == 0 || !conversations.evict_oldest(park_stop_context)) return 0;
                                 if (spill_writer) {   // (2c: the victim went to the background writer: its memory is back once written)
                                     spill_writer->wait_idle();
                                     spill_reclaim();
@@ -13851,8 +13855,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (!fits) {
-                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked%s%s)\n",
-                                     additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked%s%s)\n",                                     additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
                                      evicted, conversations.size(),
                                      no_progress ? "; the last eviction gave no memory back, so the rest stay parked" : "",
                                      cannot_help_note.c_str());
@@ -18023,7 +18026,11 @@ int main(int argc, char** argv) {
                     };
                 }
                 if (save) {
-                    if (live_ok && !live.empty() && !park_current(0)) {
+                    park_stop_context = true;   // the live-park must evict only what the disk already holds (see park_source)
+                    bool parked_live_ok = true;
+                    if (live_ok && !live.empty()) parked_live_ok = park_current(0);
+                    park_stop_context = false;
+                    if (!parked_live_ok) {
                         std::fprintf(stderr, "strata serve: park save: the live conversation could not be parked (%s); "
                                      "saving the others\n", err.c_str());
                         err.clear();
