@@ -551,11 +551,13 @@ public:
         return longest;
     }
 
-    bool put(SavedConversation&& image, size_t held = 0) {
+    // saved_only (v1.3, review F3): the stop's live-park re-runs make_room HERE too (the capture can outgrow the
+    // estimate that passed the gate earlier) - without the flag it would evict unsaved entries at the back door.
+    bool put(SavedConversation&& image, size_t held = 0, bool saved_only = false) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
-        if (!make_room(n, held)) return false;
+        if (!make_room(n, held, saved_only)) return false;
         entries_.push_back(std::move(image));
         serials_.push_back(next_serial_++);
         bytes_ += n;

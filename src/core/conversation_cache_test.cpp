@@ -785,5 +785,21 @@ int main() {
         SavedConversation c2 = image({9, 8, 7, 6, 5}); c2.checkpoints = {cp({9})};
         check(cache.make_room(c2.bytes(), 0, true), "a disk-held entry IS evictable even stop-context");
     }
+    {
+        // v1.3 review F3: put()'s internal make_room re-checked the room WITHOUT saved_only, so a captured
+        // image bigger than the estimate that passed the gate could still evict an unsaved entry at the stop.
+        ConversationCache cache(1u << 24, 1);   // one slot: every put takes room from the incumbent
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        SavedConversation a = image({1, 2, 3, 4}); a.checkpoints = {cp({1, 2, 3})};
+        check(cache.put(std::move(a), 0, true), "the stop-context put admits while room is free");
+        SavedConversation b = image({8, 7, 6, 5, 4}); b.checkpoints = {cp({8, 7})};   // no supersession overlap
+        check(!cache.put(std::move(b), 0, true), "stop-context put REFUSES instead of evicting the unsaved entry");
+        check(cache.size() == 1, "the unsaved entry survived the refused put");
+        SavedConversation s = image({5, 5, 5}); s.checkpoints = {cp({5})}; s.disk_name = "c5-3";
+        check(cache.put(std::move(s), 0, false), "mid-run put still takes it (LRU unchanged)");
+        SavedConversation d = image({6, 6, 6, 6}); d.checkpoints = {cp({6})};
+        check(cache.put(std::move(d), 0, true), "stop-context put does evict a disk-held entry");
+        check(cache.size() == 1, "and the new image is the one parked");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

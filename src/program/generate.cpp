@@ -11783,7 +11783,7 @@ int main(int argc, char** argv) {
                     }
                     return true;
                 }
-                const bool stored = conversations.put(std::move(image), held);
+                const bool stored = conversations.put(std::move(image), held, park_stop_context);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -15040,19 +15040,32 @@ int main(int argc, char** argv) {
                         std::error_code ec;
                         std::filesystem::create_directories(spill_dir, ec);
                         if (ec) { err = "cannot create " + spill_dir + ": " + ec.message(); return false; }
-                        // endurance (v1.2): the name IS the hash of the conversation's token ids and length, so a
-                        // same-name set already on disk holds provably the same bytes the write would produce -
-                        // re-stamp the manifest line (age freshness) and skip the GBs. Every-refusal rewrite of a
-                        // 5 GiB stage pair was the one thing an alternating long-session workload would notice.
-                        {
-                            std::ifstream probe(spill_dir + "/" + name_out + "-s0.ses", std::ios::binary);
-                            std::ifstream probe_last(spill_dir + "/" + name_out + "-s" + std::to_string(stages.size()) + ".ses", std::ios::binary);
-                            bool line_there = false;
+                        // endurance (v1.2; soundness gates from the independent review -> v1.3): the name hashes
+                        // ids + length, and it identifies the BYTES only when nothing else is serialized: no
+                        // attached images (an empty live list forces every checkpoint's list empty by the prefix
+                        // rule) and no loaded cvec (else the per-image flag varies per request). The manifest tag
+                        // covers env/engine/version but NOT the model - so every stage file's own header must
+                        // carry this process's model/config fingerprint before the skip may trust it. Any doubt
+                        // falls through to the normal write, which re-keys the files to the current identity.
+                        strata::core::SessionFileIdentity sid;
+                        if (!session_identity(sid, err, std::function<void()>())) return false;
+                        bool line_there = false;
+                        if (img.live.imgs.empty() && !strata::kernels::cvec().loaded()) {
+                            bool files_there = true;
+                            for (size_t s = 0; files_there && s <= stages.size(); ++s) {
+                                const std::string sp = spill_dir + "/" + name_out + "-s" + std::to_string(s) + ".ses";
+                                std::error_code ex;
+                                files_there = std::filesystem::exists(sp, ex);
+                                if (files_there) {   // local herr: a declining check must not poison the request error channel
+                                    std::string herr;
+                                    if (!strata::core::session_file_header_id(sp, sid, herr)) files_there = false;
+                                }
+                            }
                             { std::ifstream mf(spill_dir + "/park.manifest", std::ios::binary); std::string w;
                               while (mf >> w) { if (w == "end") break;
                                   if (w == "conv") { std::string nm; long long tk, pk; if (mf >> nm >> tk >> pk && nm == name_out) line_there = true; }
                                   else mf.seekg(0, std::ios::cur); } }
-                            if (probe && probe_last && line_there) {
+                            if (files_there && line_there) {
                                 // re-stamp only: rewrite the manifest with this line's parked time = now
                                 const int64_t now_s = (int64_t) std::chrono::duration_cast<std::chrono::seconds>(
                                     std::chrono::system_clock::now().time_since_epoch()).count();
@@ -15095,8 +15108,6 @@ int main(int argc, char** argv) {
                                 }
                             }
                         }
-                        strata::core::SessionFileIdentity sid;
-                        if (!session_identity(sid, err, std::function<void()>())) return false;
                         // the same truncation the walk writes: shallowest + deepest when the stage lists line up
                         const size_t n_st_s = stages.size();
                         const size_t n0 = img.checkpoints.size();
@@ -15191,10 +15202,18 @@ int main(int argc, char** argv) {
                     };
                 }
                 if (save) {
-                    park_stop_context = true;   // the live-park must evict only what the disk already holds (see park_source)
                     bool parked_live_ok = true;
-                    if (live_ok && !live.empty()) parked_live_ok = park_current(0);
-                    park_stop_context = false;
+                    {   // review F4+F5 (v1.3): the stop protects its unsaved entries ONLY where a refusal is
+                        // guaranteed to spill (a sink installed) - without one, saved_only would trade the P5 loss
+                        // of the oldest unsaved for a silent loss of the LIVE conversation.  RAII so no exit path
+                        // (park_current's own catches or anything past them) can leak the flag into request parks.
+                        struct StopCtx {
+                            bool& f; const bool prev;
+                            explicit StopCtx(bool& flag, bool v) : f(flag), prev(flag) { f = v; }
+                            ~StopCtx() { f = prev; }
+                        } stop_ctx{park_stop_context, static_cast<bool>(park_spill_fn)};
+                        if (live_ok && !live.empty()) parked_live_ok = park_current(0);
+                    }
                     if (!parked_live_ok) {
                         std::fprintf(stderr, "strata serve: park save: the live conversation could not be parked (%s); "
                                      "saving the others\n", err.c_str());
