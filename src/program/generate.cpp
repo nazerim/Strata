@@ -11770,20 +11770,29 @@ int main(int argc, char** argv) {
                 const size_t snapshot_bytes = image.bytes();
                 image.parked_unix = (int64_t) std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();   // PARKSAVE's age limit (STRATA_PARK_MAX_AGE_H)
-                if (spill_instead) {
+                const auto spill_now = [&]() -> bool {
                     std::string spill_name;
-                    if (park_spill_fn(image, spill_name))
+                    if (park_spill_fn(image, spill_name)) {
                         std::fprintf(stderr, "strata serve: conversation cache: spilled %zu tokens (%zu MiB) to disk as %s "
                                              "- the boot load and the keep-guard treat it like a parked set\n",
                                      src.ids.size(), snapshot_bytes >> 20, spill_name.c_str());
-                    else {
-                        std::fprintf(stderr, "strata serve: conversation cache: spill of %zu tokens failed: %s\n",
-                                     src.ids.size(), err.c_str());
-                        err.clear();   // review F4: skip-parking paths must not poison the request error channel (:11633 rule)
+                        return true;
                     }
+                    std::fprintf(stderr, "strata serve: conversation cache: spill of %zu tokens failed: %s\n",
+                                 src.ids.size(), err.c_str());
+                    err.clear();   // review F4: skip-parking paths must not poison the request error channel (:11633 rule)
+                    return false;
+                };
+                if (spill_instead) {
+                    spill_now();
                     return true;
                 }
-                const bool stored = conversations.put(std::move(image), held, park_stop_context);
+                // N1 (v1.3 re-review): put()'s internal make_room can now REFUSE stop-context when the capture
+                // outgrew the estimate that passed the gate; put does not consume its argument on any failure
+                // return, and the F4 invariant says a refusal means spill, never loss - so the refused image goes
+                // to the sink.  Without a sink installed the plain "skipped" stands, exactly pre-v1.1 (F4/N5).
+                bool stored = conversations.put(std::move(image), held, park_stop_context);
+                if (!stored && park_spill_fn) stored = spill_now();
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),

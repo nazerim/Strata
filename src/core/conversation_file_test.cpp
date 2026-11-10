@@ -228,6 +228,41 @@ int main() {
         check(session_file_write(again.string(), original, id, written, error), "second write");
         check(slurp(again) == slurp(good), "format is deterministic");
     }
+    // session_file_header_id (v1.3, review N3): the header-only trust check behind the endurance skip - it must
+    // accept the file the same identity wrote and decline every state a later full read would reject anyway.
+    {
+        std::string herr;
+        check(session_file_header_id(good.string(), id, herr), "header id: the writer's own identity is trusted");
+        check(herr.empty(), "header id: accept leaves no error");
+        const SessionFileIdentity wrong_model{0xdeadbeef00000001ull, id.config};
+        check(!session_file_header_id(good.string(), wrong_model, herr) && herr.find("model") != std::string::npos,
+              "header id: another model fingerprint declines");
+        const SessionFileIdentity wrong_config{id.model, 0xdeadbeef00000002ull};
+        check(!session_file_header_id(good.string(), wrong_config, herr) && herr.find("configuration") != std::string::npos,
+              "header id: another config fingerprint declines");
+        const std::vector<char> v = slurp(good);
+        const fs::path flipped = dir / "flipped.bin";
+        std::vector<char> f = v;
+        f[8] ^= 0x40;   // version byte: the header checksum then disagrees
+        { std::ofstream w(flipped, std::ios::binary | std::ios::trunc); w.write(f.data(), (std::streamsize)f.size()); }
+        check(!session_file_header_id(flipped.string(), id, herr), "header id: a broken header declines (checksum)");
+        const fs::path trunc = dir / "trunc.bin";   // valid header, smaller file: payload-vs-size consistency
+        { std::ofstream w(trunc, std::ios::binary | std::ios::trunc); w.write(v.data(), (std::streamsize)(v.size() - 32)); }
+        check(!session_file_header_id(trunc.string(), id, herr) && herr.find("disagrees") != std::string::npos,
+              "header id: a truncated payload declines");
+        const fs::path link = dir / "hdr-link.bin";   // unique: the write-refusal block owns link.bin further down
+        std::error_code lec;
+        fs::remove(link, lec);
+        fs::create_symlink(good, link, lec);
+        if (!lec) {
+            check(!session_file_header_id(link.string(), id, herr), "header id: a symbolic link declines (no-follow open)");
+            check(rejects(link, id), "full read: the symbolic link declines there too (same discipline)");
+        } else {
+            check(true, "header id: symlink case skipped (unsupported on this fs)");
+        }
+        check(!session_file_header_id((dir / "absent.bin").string(), id, herr) && !herr.empty(),
+              "header id: an absent file declines with an error");
+    }
     // saving over an existing file replaces it (MoveFileExW on Windows, rename elsewhere)
     {
         const fs::path over = dir / "over.bin";
