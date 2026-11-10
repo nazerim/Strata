@@ -11560,6 +11560,14 @@ int main(int argc, char** argv) {
             });
         };
         pool_topup();   // the first request's checkpoints find the pool full
+        // park-spill (512K regime): when RAM admission or the byte budget refuses a conversation too big for the
+        // cache, the captured image is written to the PARK files instead of dropped.  Installed by the park command
+        // (generate.cpp, STRATA_PARK_SPILL=1 with STRATA_PARK_DIR, file mode); it outlives the command because a
+        // mid-request refusal uses it too, so everything it needs is value-captured or main-scope.  The manifest
+        // line it appends follows the stop-save grammar, so the keep-guard re-lists it, age alone prunes it, and
+        // the boot PARKLOAD attempts it through the usual validation and admission - a too-big-for-RAM entry
+        // simply stays durable on disk instead of vanishing at the stop.
+        std::function<bool(strata::core::SavedConversation&, std::string& name_out)> park_spill_fn;
         auto park_source = [&](const ParkSource& src, size_t held) -> bool {
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
@@ -11658,10 +11666,12 @@ int main(int argc, char** argv) {
             // estimate must stay uncapped: it counts the retained buffers'
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
+            bool spill_instead = false;   // park-spill: capture runs, the image goes to the disk, never to the cache
             if (!conversations.make_room(estimate, held)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
-                return true;
+                if (!park_spill_fn) return true;
+                spill_instead = true;
             }
             const auto t0 = Clock::now();
             try {
@@ -11692,7 +11702,8 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
                                  evicted, conversations.size());
-                    return true;
+                    if (!park_spill_fn) return true;
+                    spill_instead = true;
                 }
                 if (evicted)
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
@@ -11746,6 +11757,17 @@ int main(int argc, char** argv) {
                 const size_t snapshot_bytes = image.bytes();
                 image.parked_unix = (int64_t) std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();   // PARKSAVE's age limit (STRATA_PARK_MAX_AGE_H)
+                if (spill_instead) {
+                    std::string spill_name;
+                    if (park_spill_fn(image, spill_name))
+                        std::fprintf(stderr, "strata serve: conversation cache: spilled %zu tokens (%zu MiB) to disk as %s "
+                                             "- the boot load and the keep-guard treat it like a parked set\n",
+                                     src.ids.size(), snapshot_bytes >> 20, spill_name.c_str());
+                    else
+                        std::fprintf(stderr, "strata serve: conversation cache: spill of %zu tokens failed: %s\n",
+                                     src.ids.size(), err.c_str());
+                    return true;
+                }
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
@@ -14984,6 +15006,110 @@ int main(int argc, char** argv) {
                     if (s == 0) return (n_st > 0 && !mtp_first) ? nullptr : &mtp.kv_state();
                     return !mtp_first && s == n_st ? &mtp.kv_state() : nullptr;
                 };
+                // park-spill installation (STRATA_PARK_SPILL=1, file mode): the refusal site in park_source calls
+                // this with a freshly captured, disposable image - so no Lend dance (the walk must return the
+                // checkpoints to its cache entry, this image dies after the write).  Everything the function uses
+                // after this command ends is value-captured or main-scope; its manifest line joins the grammar the
+                // stop-save, the keep-guard, the age rule and PARKLOAD already speak.
+                if (std::getenv("STRATA_PARK_SPILL") != nullptr && std::getenv("STRATA_PARK_SPILL")[0] == '1' && !ramlike) {
+                    const std::string spill_dir = dir, spill_tag = tag;
+                    const uint64_t spill_min_free = (uint64_t) o.session_min_free_mib << 20;
+                    park_spill_fn = [spill_dir, spill_tag, spill_min_free, &err, &stages, &session_identity](
+                                strata::core::SavedConversation& img, std::string& name_out) -> bool {
+                        const std::vector<int32_t>& ids = img.live.ids;
+                        const uint64_t h = strata::core::session_hash64(ids.data(), ids.size() * sizeof(int32_t), 0x5041524bULL);
+                        char base[64];
+                        std::snprintf(base, sizeof base, "c%016llx-%zu", (unsigned long long) h, ids.size());
+                        name_out = base;
+                        const std::string manifest = spill_dir + "/park.manifest";
+                        std::error_code ec;
+                        std::filesystem::create_directories(spill_dir, ec);
+                        if (ec) { err = "cannot create " + spill_dir + ": " + ec.message(); return false; }
+                        strata::core::SessionFileIdentity sid;
+                        if (!session_identity(sid, err, std::function<void()>())) return false;
+                        // the same truncation the walk writes: shallowest + deepest when the stage lists line up
+                        const size_t n_st_s = stages.size();
+                        const size_t n0 = img.checkpoints.size();
+                        bool lined_up = true;
+                        for (const auto& si : img.stage_images) lined_up = lined_up && si.checkpoints.size() == n0;
+                        std::vector<size_t> keep;
+                        if (n0 > 0) {
+                            size_t lo = 0, hi = 0;
+                            for (size_t j = 1; j < n0; ++j) {
+                                if (img.checkpoints[j].ids.size() > img.checkpoints[hi].ids.size()) hi = j;
+                                if (img.checkpoints[j].ids.size() < img.checkpoints[lo].ids.size()) lo = j;
+                            }
+                            keep.push_back(std::min(lo, hi));
+                            if (lo != hi) keep.push_back(std::max(lo, hi));
+                        }
+                        if (!lined_up) { keep.clear(); for (size_t j = 0; j < n0; ++j) keep.push_back(j); }
+                        strata::core::SessionWriteOptions wo;
+                        wo.min_free_bytes = spill_min_free;
+                        wo.durable = true;
+                        wo.progress = [](uint64_t done, uint64_t) { strata::core::progress_at("spilling a conversation to disk, MiB", done); };
+                        for (size_t s = 0; s <= n_st_s; ++s) {
+                            strata::core::SavedConversation& part = s == 0 ? img : img.stage_images[s - 1];
+                            if (lined_up) {
+                                std::vector<ConvCheckpoint> trimmed;
+                                for (size_t j : keep) if (j < part.checkpoints.size()) trimmed.push_back(std::move(part.checkpoints[j]));
+                                part.checkpoints.swap(trimmed);
+                            }
+                            size_t b = 0;
+                            strata::core::SessionStatus st;
+                            try {
+                                if (!strata::core::session_file_write(spill_dir + "/" + name_out + "-s" + std::to_string(s) + ".ses",
+                                                                      part, sid, b, err, wo, &st)) return false;
+                            } catch (const std::bad_alloc&) { err = "out of memory while spilling"; return false; }
+                        }
+                        strata::core::progress_at("request");
+                        // merge the manifest: keep the current lines (any tag-mismatched or unparseable manifest is
+                        // republished clean - those files would be refused at load anyway), replace this name's
+                        // line if present, append ours with parked time NOW.
+                        std::string list;
+                        {
+                            std::ifstream mf(manifest, std::ios::binary);
+                            std::string w;
+                            bool fmt_ok = false, tag_ok = false;
+                            std::vector<std::string> others;
+                            while (mf >> w) {
+                                if (w == "strata-park") { int f = 0; mf >> f; fmt_ok = (f == 2); continue; }
+                                if (w == "tag") { std::string t; mf >> t; tag_ok = (t == spill_tag); continue; }
+                                if (w == "stages") { int sn = 0; mf >> sn; continue; }
+                                if (w == "conv") {
+                                    std::string nm; long long tk = 0, pk = 0;
+                                    if (!(mf >> nm >> tk >> pk)) { fmt_ok = false; break; }
+                                    if (nm != name_out && fmt_ok && tag_ok) {
+                                        std::ostringstream ol; ol << "conv " << nm << " " << tk << " " << pk << "\n";
+                                        others.push_back(ol.str());
+                                    }
+                                    continue;
+                                }
+                                if (w == "end") break;
+                                fmt_ok = false; break;
+                            }
+                            for (const auto& o : others) list += o;
+                        }
+                        const int64_t now_s = (int64_t) std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        list += "conv " + name_out + " " + std::to_string(ids.size()) + " " + std::to_string(now_s) + "\n";
+                        const std::string tmp = manifest + ".tmp";
+                        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+                        f << "strata-park 2\ntag " << spill_tag << "\nstages " << (n_st_s + 1) << "\n" << list << "end\n";
+                        f.close();
+                        if (!f) { err = "cannot write " + tmp; return false; }
+#ifndef _WIN32
+                        {   int fd = ::open(tmp.c_str(), O_RDONLY);
+                            if (fd >= 0) { (void) ::fsync(fd); ::close(fd); } }
+#endif
+                        std::filesystem::rename(tmp, manifest, ec);
+                        if (ec) { err = "cannot publish " + manifest + ": " + ec.message(); return false; }
+#ifndef _WIN32
+                        {   int dfd = ::open(spill_dir.c_str(), O_RDONLY);
+                            if (dfd >= 0) { (void) ::fsync(dfd); ::close(dfd); } }
+#endif
+                        return true;
+                    };
+                }
                 if (save) {
                     if (live_ok && !live.empty() && !park_current(0)) {
                         std::fprintf(stderr, "strata serve: park save: the live conversation could not be parked (%s); "
