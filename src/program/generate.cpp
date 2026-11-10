@@ -11689,26 +11689,32 @@ int main(int argc, char** argv) {
                 // below say what it did either way.  The reading is the guard's (MemAvailable, the cgroup
                 // limits above the engine, --memory-limit-mib); `mem` keeps the last one for the refusal line.
                 size_t evicted = 0;
-                std::optional<strata::core::HostMemoryReading> mem;
-                auto admit = [&] {
-                    mem = strata::core::sample_host_memory();
-                    return strata::core::conversation_memory_admit(
-                        mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
-                };
-                while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
-                       conversations.evict_oldest())
-                    ++evicted;
-                if (!admit()) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
-                                 additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
-                                 evicted, conversations.size());
-                    if (!park_spill_fn) return true;
-                    spill_instead = true;
+                // park-spill review F1: an image already bound for the disk needs no admission, and running the
+                // evict loop for it would pay for an entry it can never become (a budget-refused image is larger
+                // than the whole budget - no eviction can admit it) by destroying the healthy cache, which the
+                // stop-save would then not see. The staging rides swap by design; the write is its exit.
+                if (!spill_instead) {
+                    std::optional<strata::core::HostMemoryReading> mem;
+                    auto admit = [&] {
+                        mem = strata::core::sample_host_memory();
+                        return strata::core::conversation_memory_admit(
+                            mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
+                    };
+                    while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
+                           conversations.evict_oldest())
+                        ++evicted;
+                    if (!admit()) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
+                                     additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
+                                     evicted, conversations.size());
+                        if (!park_spill_fn) return true;
+                        spill_instead = true;
+                    }
+                    if (evicted)
+                        std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
+                                     evicted, evicted == 1 ? "" : "s", additional >> 20,
+                                     (long long) o.conversation_cache_min_free_mib);
                 }
-                if (evicted)
-                    std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
-                                 evicted, evicted == 1 ? "" : "s", additional >> 20,
-                                 (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 // STRATA_CKPT_POOL: the running state and the checkpoint copies go into dropped checkpoints' vectors
@@ -11748,7 +11754,10 @@ int main(int argc, char** argv) {
                     image.stage_images.push_back(std::move(part));
                 }
                 const auto mem_after = strata::core::sample_host_memory();
-                if (!strata::core::conversation_memory_admit(
+                // park-spill review F2: a floor wobble AFTER capture must not drop the image - for a spilling
+                // conversation the write is exactly what frees the staging, and dropping here repeats the silent
+                // loss this hook exists to end. A cache-bound image still refuses, as before.
+                if (!spill_instead && !strata::core::conversation_memory_admit(
                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s)\n",
                                  (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
@@ -11763,9 +11772,11 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: conversation cache: spilled %zu tokens (%zu MiB) to disk as %s "
                                              "- the boot load and the keep-guard treat it like a parked set\n",
                                      src.ids.size(), snapshot_bytes >> 20, spill_name.c_str());
-                    else
+                    else {
                         std::fprintf(stderr, "strata serve: conversation cache: spill of %zu tokens failed: %s\n",
                                      src.ids.size(), err.c_str());
+                        err.clear();   // review F4: skip-parking paths must not poison the request error channel (:11633 rule)
+                    }
                     return true;
                 }
                 const bool stored = conversations.put(std::move(image), held);
@@ -15046,7 +15057,17 @@ int main(int argc, char** argv) {
                         strata::core::SessionWriteOptions wo;
                         wo.min_free_bytes = spill_min_free;
                         wo.durable = true;
-                        wo.progress = [](uint64_t done, uint64_t) { strata::core::progress_at("spilling a conversation to disk, MiB", done); };
+                        wo.progress = [](uint64_t done, uint64_t) {
+                            strata::core::progress_at("spilling a conversation to disk, MiB", done >> 20);
+                            strata::core::progress_allow(0);   // review F3: the walk's own beat - a writing phase is alive
+                        };
+                        wo.phase = [](const char* ph, uint64_t bytes) {
+                            // review F3: flush/rename get the same bounded allowance the stop-save walk grants, or a
+                            // contended-disk fsync of a multi-GB stage reads as a stalled engine to the watchdog.
+                            const int64_t s = strata::core::session_phase_limit_s(bytes);
+                            strata::core::progress_at(ph);
+                            strata::core::progress_allow(s);
+                        };
                         for (size_t s = 0; s <= n_st_s; ++s) {
                             strata::core::SavedConversation& part = s == 0 ? img : img.stage_images[s - 1];
                             if (lined_up) {
