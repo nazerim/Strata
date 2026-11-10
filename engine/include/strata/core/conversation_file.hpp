@@ -253,6 +253,12 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
 
+// Header-only identity check: opens the file by its handle (no symlink follow, same discipline as
+// session_file_read), validates magic/version/checksum and the model/config fingerprints, and reads
+// nothing else - the cheap guard for callers that want to TRUST a multi-GB file exists with a sound
+// promise it still loads (park-spill's endurance skip), without paying the payload parse.
+bool session_file_header_id(const std::string& path, const SessionFileIdentity& id, std::string& error);
+
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).

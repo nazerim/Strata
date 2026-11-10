@@ -1490,6 +1490,38 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     st.error = SessionError::none;
     return true;
 }
+// session_file_header_id's body: everything read_impl does before it ever looks at the payload.
+bool header_id_impl(const std::string& path, const SessionFileIdentity& id, std::string& error) {
+    error.clear();
+    RawFile raw;
+    uint64_t size = 0;
+#ifdef _WIN32
+    const bool opened = session_is_section(path) ? raw.open_section(path.substr(4), size) : raw.open_session(path, size);
+#else
+    if (session_is_section(path)) { error = "session section: mem: sessions exist on Windows only"; return false; }
+    const bool opened = raw.open_session(path, size);
+#endif
+    if (!opened) { error = "session file: " + path + ": " + raw.error(); return false; }
+    if (size < kHeader + kTrailer) { error = "session file: header of " + path + " is below the minimum size"; return false; }
+    uint8_t h[kHeader];
+    FileSource f(raw);
+    if (!f.ok()) { error = "session file: header open of " + path + ": " + f.error(); return false; }
+    f.expected = size;
+    if (!f.read(h, kHeader)) { error = "session file: header read error: " + f.error(); return false; }
+    uint32_t version = 0, hsize = 0;
+    uint64_t model = 0, config = 0, payload = 0, r0 = 0, r1 = 0, hh = 0;
+    std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
+    std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
+    std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
+    if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: header of " + path + ": not a Strata session file (magic)"; return false; }
+    if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch in " + path; return false; }
+    if (version != kVersion) { error = "session file: header of " + path + ": unsupported version " + std::to_string(version); return false; }
+    if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields in " + path; return false; }
+    if (model != id.model) { error = "session file: " + path + " was saved with another model (model fingerprint differs)"; return false; }
+    if (config != id.config) { error = "session file: " + path + " was saved with another engine configuration (config fingerprint differs)"; return false; }
+    if (payload > size || size - kHeader - kTrailer != payload) { error = "session file: header size in " + path + " disagrees with the file"; return false; }
+    return true;
+}
 } // namespace
 
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
@@ -1505,6 +1537,15 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     }
     if (status) *status = st;
     return ok;
+}
+
+bool session_file_header_id(const std::string& path, const SessionFileIdentity& id, std::string& error) {
+    try {
+        return header_id_impl(path, id, error);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while reading the header of " + path;
+        return false;
+    }
 }
 
 } // namespace strata::core
