@@ -53,8 +53,8 @@ turn(){ local tag=$1 salt=$2 code=$3 extra=${4:-}
 GROW="Now, as a final instruction for the archive, do three things. First, state the shipment code once more, exactly, followed by the date 2026-11-11. Second, list four procedural safeguards a warehouse should apply when a coded shipment crosses a jurisdictional boundary, each in one numbered sentence. Third, write a two-sentence summary of why deterministic recall of coded identifiers matters more for audit chains than for routine logistics, and close by repeating the identifier alone on the final line. Please be brief and factual, and remember that the response will be checked by an automated verifier that compares tokens literally, so punctuation and casing of the identifier must match what you were told earlier, character for character, with no surrounding quotation marks or commentary on the same final line as the identifier itself. The archive format expects the identifier to appear exactly twice in the whole response: once in the first sentence of the restated form and once alone on the final line. Any deviation, paraphrase, expansion, or additional occurrence will fail verification and trigger a costly manual review cycle. This instruction block was appended to the thread after the original conversation and represents the grown request the restore path must serve from disk state plus a new tail."
 
 holder(){ # on <MiB>: shrink MemAvailable (forces RAM admission refusal at the next park -> spill)
-  if [ "$2" = on ]; then dd if=/dev/zero of=/dev/shm/g3-holder bs=1M count=$1 status=none
-    say "RAM holder ON: $1 MiB in /dev/shm (avail now $(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo) MiB)"
+  if [ "$1" = on ]; then dd if=/dev/zero of=/dev/shm/g3-holder bs=1M count=$2 status=none
+    say "RAM holder ON: $2 MiB in /dev/shm (avail now $(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo) MiB)"
   else rm -f /dev/shm/g3-holder
     say "RAM holder OFF (avail now $(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo) MiB)"
   fi; }
