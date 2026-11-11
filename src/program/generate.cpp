@@ -95,6 +95,7 @@
 #include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/park_restore.hpp"   // park-restore (STRATA_PARK_RESTORE=1): selection, grammar, pre-screen
 #include "strata/program/split_rules.hpp"
 #include "strata/program/stage_reserve.hpp"
 #include "strata/program/gpu_report.hpp"
@@ -11568,6 +11569,17 @@ int main(int argc, char** argv) {
         // the boot PARKLOAD attempts it through the usual validation and admission - a too-big-for-RAM entry
         // simply stays durable on disk instead of vanishing at the stop.
         std::function<bool(strata::core::SavedConversation&, std::string& name_out)> park_spill_fn;
+        // park-restore (STRATA_PARK_RESTORE=1, file mode): the mirror image of the spill installed below - where
+        // the refusal path writes a too-big-for-RAM conversation out, this reads a young spilled conversation back,
+        // MID-RUN, when a prompt's cache match falls at or below the reuse the request already had (the cold-
+        // prefill fall-through: a switched-back thread used to pay the whole prefill again while its stage files
+        // waited seconds away on NVMe).  Installed by the park command, so its refusals gate it (same folder, same
+        // file mode, same single-writer loop); called by the request path at its match.  True means an entry went
+        // into the cache: the caller re-runs best() and the take, the discard validations, the #2409 fits check and
+        // the parking of the outgoing state all see it exactly as a RAM-parked one.  Like the spill, everything it
+        // uses after the command ends is value-captured or main-scope - and it prints NO between-commands protocol
+        // lines on a request's way in (the boot reader's SESSION progress is deliberately not reused).
+        std::function<bool(const std::vector<int64_t>&, const std::vector<ImgKey>&, bool, int64_t)> park_restore_fn;
         // set while PARKSAVE's own live-park runs: make_room/evict_oldest then take only entries the disk already
         // holds, so capturing a big live conversation can never evict an unsaved parked one (the stop-path eviction
         // bug the P5 assertion caught: E's admission destroyed C before the walk could write it)
@@ -15210,6 +15222,271 @@ int main(int argc, char** argv) {
                         return true;
                     };
                 }
+                // park-restore installation (STRATA_PARK_RESTORE=1, file mode; the contract independent
+                // review #1 corrected): the request path calls this when a prompt's cache match does not
+                // reach past what the request already reuses - the fall-through that, until now, re-read a
+                // switched-back thread cold while its spilled stage files sat seconds away on NVMe. The
+                // candidates come from the same manifest the spill and the stop-save write; the read is
+                // session_file_read's full trust discipline - the same the boot load insists on (regular
+                // file, one name, this process's fingerprints in every stage header, one-shot RAM admission
+                // BEFORE any payload allocation) - every stage is validated before the put exactly like boot,
+                // and the entry carries BOTH fields a boot-loaded one carries. Everything it uses after this
+                // command ends is value-captured or main-scope, like the spill above it. The gate is
+                // deliberately invisible to the manifest tag (STRATA_PARK_* are excluded from it): switching
+                // restore off at a later boot invalidates nothing and needs no re-key.
+                if (std::getenv("STRATA_PARK_RESTORE") != nullptr && std::getenv("STRATA_PARK_RESTORE")[0] == '1' && !ramlike) {
+                    const std::string restore_dir = dir, restore_manifest = manifest, restore_tag = tag;
+                    const strata::core::SessionFileIdentity restore_id = id;
+                    const size_t restore_st = n_st;
+                    const int64_t restore_gain = std::max<int64_t>(1, env_i64("STRATA_PARK_RESTORE_GAIN", 4096));
+                    const size_t restore_tries = (size_t) std::max<int64_t>(1, env_i64("STRATA_PARK_RESTORE_TRIES", 2));
+                    const uint64_t restore_cap = (uint64_t) std::max<int64_t>(1,
+                                                    env_i64("STRATA_PARK_RESTORE_MAX_MIB", 6144)) << 20;
+                    const int64_t restore_age_s = max_age_s;
+                    const long long restore_min_free = o.conversation_cache_min_free_mib;
+                    const uint64_t restore_floor = (uint64_t) restore_min_free << 20;
+                    const uint64_t restore_max_ctx = (uint64_t) o.max_context;
+                    park_restore_fn = [restore_dir, restore_manifest, restore_tag, restore_id, restore_st, restore_gain,
+                                       restore_tries, restore_cap, restore_age_s, restore_floor, restore_min_free,
+                                       restore_max_ctx, &conversations, &stages, &ss, &g, &mtp, &use_mtp, &mtp_first](
+                                      const std::vector<int64_t>& ids, const std::vector<ImgKey>& req_imgs,
+                                      bool want_cvec, int64_t floor_tokens) -> bool {
+                        const auto t0 = Clock::now();
+                        auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
+                        // every offered candidate that fails has a NAMED decline (the reasons units and the G3
+                        // harness pin); a candidate the selection never offered stays silent - the common case
+                        auto declined = [](const std::string& name, const std::string& why) {
+                            std::fprintf(stderr, "strata serve: spill restore: candidate %s declined (%s)\n",
+                                         name.c_str(), why.c_str());
+                        };
+                        struct RestoreStage {   // #2049 naming, like the park's own: a stall report says what is moving
+                            RestoreStage() { strata::core::progress_at("request: restoring a spilled conversation"); }
+                            ~RestoreStage() { strata::core::progress_at("request"); strata::core::progress_beat(); }
+                        } restore_stage;
+                        std::ifstream mf(restore_manifest, std::ios::binary);
+                        if (!mf) return false;                       // no manifest yet: today's cold path, silent
+                        std::ostringstream all;
+                        all << mf.rdbuf();
+                        strata::program::park_restore::Header mh;
+                        std::vector<strata::program::park_restore::Line> lines;
+                        std::string why;
+                        if (!strata::program::park_restore::parse_manifest(all.str(), mh, lines, why)) {
+                            std::fprintf(stderr, "strata serve: spill restore: %s: %s; no candidates\n",
+                                         restore_manifest.c_str(), why.c_str());
+                            return false;
+                        }
+                        if (mh.tag != restore_tag) {   // another engine file or STRATA_* set: the boot load says the same
+                            std::fprintf(stderr, "strata serve: spill restore: %s was saved by another engine file or "
+                                         "STRATA_* switch set (tag %s, this one %s); no candidates\n",
+                                         restore_manifest.c_str(), mh.tag.c_str(), restore_tag.c_str());
+                            return false;
+                        }
+                        if (mh.stages != restore_st + 1) {
+                            std::fprintf(stderr, "strata serve: spill restore: the parked files have %llu stages, this "
+                                         "engine %zu; no candidates\n", (unsigned long long) mh.stages, restore_st + 1);
+                            return false;
+                        }
+                        const int64_t now_unix = (int64_t) std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        strata::program::park_restore::SelectParams sp;
+                        sp.request_len = (int64_t) ids.size();
+                        sp.floor_tokens = floor_tokens;
+                        sp.gain = restore_gain;
+                        sp.now_unix = now_unix;
+                        sp.max_age_s = restore_age_s;
+                        sp.max_tries = restore_tries;
+                        const auto picks = strata::program::park_restore::select(lines, sp);
+                        if (picks.empty()) return false;             // nothing young AND deep enough: the common case
+                        // the same per-stage views the boot loop built, from THIS process's live objects
+                        auto ss_of = [&](size_t s) -> const strata::core::SessionState& { return s == 0 ? ss : stages[s - 1]->ss; };
+                        auto draft_of = [&](size_t s) -> const strata::core::QsaState* {
+                            if (!use_mtp) return nullptr;
+                            if (s == 0) return (restore_st > 0 && !mtp_first) ? nullptr : &mtp.kv_state();
+                            return !mtp_first && s == restore_st ? &mtp.kv_state() : nullptr;
+                        };
+                        uint64_t attempted = 0;
+                        for (const auto* c : picks) {
+                            std::vector<std::string> paths;
+                            uint64_t total = 0;
+                            bool files = true;
+                            for (size_t s = 0; s <= restore_st; ++s) {
+                                const std::string p = restore_dir + "/" + c->name + "-s" + std::to_string(s) + ".ses";
+                                std::error_code ec;
+                                const auto sz = std::filesystem::file_size(p, ec);
+                                if (ec) { files = false; break; }
+                                total += (uint64_t) sz;
+                                paths.push_back(p);
+                            }
+                            if (!files) { declined(c->name, "missing file"); continue; }
+                            if (attempted + total > restore_cap) {   // M3: attempts are bounded by BYTES, not just count
+                                declined(c->name, "byte cap (" + std::to_string(attempted >> 20) + " MiB attempted)");
+                                continue;
+                            }
+                            attempted += total;
+                            // every stage file's own header must carry this process's fingerprints before anything
+                            // is allocated: a stale-era file is named and skipped, never half-trusted
+                            bool head_ok = true;
+                            std::string e;
+                            for (const auto& p : paths)
+                                if (!strata::core::session_file_header_id(p, restore_id, e)) { head_ok = false; break; }
+                            if (!head_ok) { declined(c->name, "identity: " + e); continue; }
+                            // the pre-screen (M5): the payload's first bytes - the live ids are the first
+                            // serialized object - compared token by token with this prompt. A sibling thread's
+                            // file diverges at once: milliseconds, not the 5-11 s of a full multi-GB read ending
+                            // in a (prefix) decline. POSIX lane only; distrust never declines on a parse surprise.
+                            int pre = 1;   // 1: pass or unknown; 0: named decline
+                            std::string pre_why;
+#ifndef _WIN32
+                            {
+                                const int fd = ::open(paths[0].c_str(), O_RDONLY | O_NOFOLLOW);
+                                if (fd < 0) {
+                                    pre = 0;
+                                    pre_why = "cannot open for the pre-screen";
+                                } else {
+                                    struct stat sb;
+                                    uint8_t h[64];
+                                    uint64_t payload = 0;
+                                    bool bad = ::fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_nlink != 1 ||
+                                               (uint64_t) sb.st_size < 64u + 16u ||
+                                               ::pread(fd, h, sizeof h, 0) != (ssize_t) sizeof h;
+                                    if (!bad) {
+                                        uint32_t version = 0, hsize = 0;
+                                        uint64_t model = 0, config = 0, r0 = 0, r1 = 0, hh = 0;
+                                        std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
+                                        std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8);
+                                        std::memcpy(&payload, h + 32, 8); std::memcpy(&r0, h + 40, 8);
+                                        std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
+                                        bad = hsize != 64u || r0 != 0 || r1 != 0 ||
+                                              hh != strata::core::session_hash64(h, 56, 0) ||
+                                              model != restore_id.model || config != restore_id.config ||
+                                              payload > (uint64_t) sb.st_size ||
+                                              (uint64_t) sb.st_size - 64u - 16u != payload;
+                                        if (bad) {
+                                            pre = 0;
+                                            pre_why = "header disagrees after the manifest was read";
+                                        } else if (version != 2) {
+                                            // an unknown format: the full read's own version check has the last word
+                                        } else {
+                                            size_t need = strata::program::park_restore::kFixedPayloadBytes +
+                                                          (size_t) c->tokens * 4u + 16u;
+                                            const size_t cap_bytes = 24u << 20;
+                                            if (need > cap_bytes) need = cap_bytes;
+                                            if (need > (size_t) payload) need = (size_t) payload;
+                                            std::vector<uint8_t> buf(need);
+                                            const ssize_t got = ::pread(fd, buf.data(), need, 64);
+                                            if (got < 0) {
+                                                pre = 0;
+                                                pre_why = "cannot read the payload head";
+                                            } else {
+                                                const auto ps = strata::program::park_restore::prescreen_payload(
+                                                    buf.data(), (size_t) got, ids, floor_tokens, restore_gain,
+                                                    c->tokens, want_cvec);
+                                                if (ps.verdict == strata::program::park_restore::Verdict::reject) {
+                                                    pre = 0;
+                                                    pre_why = ps.reason;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    ::close(fd);
+                                }
+                            }
+#endif
+                            if (!pre) { declined(c->name, pre_why); continue; }
+                            // the read: the boot loop's MIRROR (not a refactor of it - the boot path stays
+                            // byte-for-byte untouched): full session_file_read discipline per stage file, the
+                            // same one-shot RAM admission before any payload allocation (a refusal allocates
+                            // nothing; a bad_alloc mid-parse unwinds this candidate's own objects, never the
+                            // request's state), and every stage validated BEFORE the put - a skipped entry the
+                            // take path would discard after removing it from the cache is exactly what boot's
+                            // 15531 refuses to load, for exactly the same reason
+                            strata::core::SavedConversation image;
+                            std::vector<strata::core::SavedConversation> parts(restore_st);
+                            bool good = true;
+                            for (size_t s = 0; s <= restore_st && good; ++s) {
+                                strata::core::SavedConversation& img = s == 0 ? image : parts[s - 1];
+                                try {
+                                    strata::core::SessionReadLimits limits;
+                                    // H3: its OWN progress. Boot's `moving` prints SESSION <done> <total> - a
+                                    // between-commands protocol line that mid-request would corrupt the
+                                    // engine's stdout stream. Watchdog allowance only, here: no writes.
+                                    limits.progress = [](uint64_t done, uint64_t /*total*/) {
+                                        strata::core::progress_at("restoring a spilled conversation, MiB",
+                                                                   (int64_t) (done >> 20));
+                                        strata::core::progress_allow(0);
+                                    };
+                                    limits.admit = [restore_floor, restore_min_free](uint64_t need, std::string& w) {
+                                        const auto mem = strata::core::sample_host_memory();
+                                        const std::optional<uint64_t> avail =
+                                            mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                                        if (strata::core::conversation_memory_admit(avail, need, restore_floor))
+                                            return true;
+                                        w = "not enough RAM to read it (" + std::to_string(need >> 20) +
+                                            " MiB plus a floor of " + std::to_string(restore_min_free) + " MiB needed)";
+                                        return false;
+                                    };
+                                    if (!strata::core::conversation_session_read_limits(
+                                            limits, ss_of(s), g, mtp.kv_state(), restore_max_ctx, 256, e)) {
+                                        good = false;
+                                        break;
+                                    }
+                                    strata::core::SessionStatus st;
+                                    size_t b = 0;
+                                    if (!strata::core::session_file_read(paths[s], restore_id, img, b, e, limits, &st)) {
+                                        good = false;
+                                        break;
+                                    }
+                                } catch (const std::bad_alloc&) {
+                                    e = "out of memory";
+                                    good = false;
+                                    break;
+                                }
+                                if (!strata::core::conversation_snapshot_validate(img, ss_of(s), g, draft_of(s), e))
+                                    good = false;
+                            }
+                            if (!good) { declined(c->name, "read: " + e); continue; }
+                            for (auto& p : parts) image.stage_images.push_back(std::move(p));
+                            if ((int64_t) image.live.ids.size() != (int64_t) c->tokens) {
+                                declined(c->name, "window");   // the manifest line did not describe these bytes
+                                continue;
+                            }
+                            if (image.cvec != want_cvec) { declined(c->name, "cvec"); continue; }
+                            // what THIS request would actually get back from the entry, required over the bar
+                            // BEFORE the put: an entry the request cannot take must not squat in the cache -
+                            // nor evict or supersede anything on its way in for a switch that did not happen
+                            int64_t depth = strata::core::conversation_prefix(image.live, ids, req_imgs);
+                            for (const auto& ckp : image.checkpoints)
+                                depth = std::max(depth, strata::core::conversation_prefix(ckp, ids, req_imgs));
+                            if (depth <= floor_tokens + restore_gain) { declined(c->name, "prefix"); continue; }
+                            // H4 parity: BOTH fields a boot-loaded entry carries (15540-41). Without disk_name a
+                            // later stop treats these bytes as unsaved; with parked_unix left 0 the entry never
+                            // ages and the keep-guard re-lists its line forever. The restored generation keeps
+                            // its ORIGINAL park time: the age rule bounds the disk, and this request's own park
+                            // at the next switch writes the thread's fresh generation under its own new name.
+                            image.parked_unix = c->parked_unix;
+                            image.disk_name = c->name;
+                            // M2: put() runs drop_superseded with no voice of its own, and #4420's protection
+                            // is wired into the slot-park path only - a {shallowest, deepest} truncated chain
+                            // CAN silently drop an unrelated RAM entry whose deepest is the shared root (the
+                            // hazard pinned by the fork's own supersede test). Boot counted its puts' fallout
+                            // around the puts so its summary could never be a lie; the restore does the same.
+                            const size_t ev0 = conversations.evictions(), su0 = conversations.superseded();
+                            if (!conversations.put(std::move(image))) { declined(c->name, "admit-refused"); continue; }
+                            const size_t dv = conversations.evictions() - ev0, ds = conversations.superseded() - su0;
+                            const int64_t got = conversations.best(ids, req_imgs, want_cvec).tokens;
+                            std::fprintf(stderr, "strata serve: spill restore: %s (%lld tokens) loaded in %.1f ms - "
+                                         "%lld tokens reused%s%s\n", c->name.c_str(), (long long) c->tokens, ms(),
+                                         (long long) got, (dv || ds) ? "; the restore itself" : "",
+                                         (dv || ds)
+                                             ? (std::to_string(dv) + " evicted, " + std::to_string(ds) + " superseded").c_str()
+                                             : "");
+                            // stop at the FIRST success: the ranking offered the newest-deepest generation first,
+                            // and reading an older one over the entry this request just won could supersede it
+                            return true;
+                        }
+                        return false;
+                    };
+                }
                 if (save) {
                     bool parked_live_ok = true;
                     {   // review F4+F5 (v1.3): the stop protects its unsaved entries ONLY where a refusal is
@@ -16348,7 +16625,19 @@ int main(int argc, char** argv) {
                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
                 }
             }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            auto parked = conversations.best(ids, req_imgs, want_cvec);
+            // park-restore (STRATA_PARK_RESTORE=1, generate.cpp's installation above): the negation of the take
+            // condition right below is the fall-through to reading this prompt cold - so check the spill first.
+            // The gate mirrors that condition exactly (never the whole else branch: the batch-slot copy can be the
+            // winner there, and in file mode it never is, PARKLOAD itself refuses --batch).  On success the match
+            // is re-run before `borrow` is decided: everything downstream - take, validations, slot_source = -1,
+            // park_drops, park_current - reads the restored entry the way it reads any RAM-parked one.  A RAM copy
+            // still beating the floor was matched by this best() already: the function is only consulted where
+            // the answer was "cold", and its own rules (age, the depth prebound, the strict tk < request bound,
+            // the file's fingerprints, the prefix bar before the put) decide everything else.
+            if (parked.tokens <= std::max(resume, slot_tokens) && park_restore_fn &&
+                park_restore_fn(ids, req_imgs, want_cvec, std::max(resume, slot_tokens)))
+                parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its

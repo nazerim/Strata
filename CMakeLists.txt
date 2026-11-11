@@ -1928,6 +1928,12 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
+  # park-restore (STRATA_PARK_RESTORE=1): the manifest/candidate/pre-screen decision rules and the put
+  # side effects a restore inherits - the window bounds, the depth prebound, the grown-thread case and
+  # the supersede delta review #1 required (header-only, CPU)
+  add_executable(park_restore_test src/program/park_restore_test.cpp)
+  target_include_directories(park_restore_test PRIVATE include)
+  add_test(NAME park_restore_test COMMAND park_restore_test)
   # --adapt-decay outside 0..1 falls back to 0.7 with a line (#1284; header-only, CPU)
   add_executable(adapt_decay_test src/program/adapt_decay_test.cpp)
   target_include_directories(adapt_decay_test PRIVATE include)
