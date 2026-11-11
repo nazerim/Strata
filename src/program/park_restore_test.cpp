@@ -155,6 +155,12 @@ int main() {
         check(b.size() == 1 && b[0]->name == "past", "depth prebound boundary: tk == floor+gain is out, +1 is in");
         std::vector<Line> absurd = {line("big", (uint64_t) 1 << 63, now)};
         check(park_restore::select(absurd, params(300000, 100, 4096, now)).empty(), "an absurd token count is not a candidate");
+        std::vector<Line> old3 = {line("ancient", 200000, now - 10 * 365 * 24 * 3600)};
+        check(park_restore::select(old3, params(300000, 100, 4096, now, 0)).size() == 1,
+              "max_age_s == 0 (STRATA_PARK_MAX_AGE_H=0): the age filter is off, exactly like the boot rule");
+        std::vector<Line> dup = {line("twice", 200000, now), line("twice", 200000, now)};
+        const auto d = park_restore::select(dup, params(300000, 100, 4096, now));
+        check(d.size() == 2, "a manifest that lists one name twice yields it twice (parser accepts; the cap double-counts its bytes - benign)");
     }
 
     // ---- 3. the payload pre-screen: it declines only what the full read would decline ----
@@ -196,6 +202,10 @@ int main() {
             const auto ps = park_restore::prescreen_payload(buf.data(), buf.size(), req, floor, gain, 170000, true);
             check(ps.verdict == park_restore::Verdict::reject && std::string(ps.reason) == "cvec",
                   "cvec flag differs from the request's: declined (best() filters by it anyway)");
+            const auto buf2 = payload(ids, true);
+            const auto ps2 = park_restore::prescreen_payload(buf2.data(), buf2.size(), req, floor, gain, 170000, false);
+            check(ps2.verdict == park_restore::Verdict::reject && std::string(ps2.reason) == "cvec",
+                  "the flipped arm too: file cvec=1 against a request cvec=0 declines");
         }
         {   // the manifest line does not describe this file's live ids
             std::vector<int32_t> ids((size_t) 170000, 1);
@@ -282,6 +292,39 @@ int main() {
         check(strata::core::ConversationCache::saved_for_evict(cache.entries()[1]) &&
                   cache.entries()[1].parked_unix == 1700000000,
               "a restored/boot-loaded entry carries disk_name AND parked_unix: evictable, ageable - the keep-guard prunes it");
+    }
+
+    {
+        // F2 (review #2) pin: put() runs drop_superseded BEFORE make_room can still refuse it. A restore put
+        // that returns false can therefore ALREADY have removed a RAM entry - the refused branch must count and
+        // log the same delta the success branch does ("admit-refused; the restore itself N evicted, M
+        // superseded"). Constructed: a pinned entry holds the budget hostage while the superseded one is gone.
+        const size_t S = strata::core::ConversationBuffer::segment_bytes + 17;
+        auto sized = [&](std::vector<int32_t> live, std::vector<std::vector<int32_t>> cps, bool pin, size_t mult) {
+            auto s = image(std::move(live), std::move(cps));
+            s.kv.emplace_back();
+            s.kv[0].k.resize(S * mult, 7);
+            if (pin && !s.checkpoints.empty()) s.checkpoints[0].pinned = true;
+            return s;
+        };
+        auto ids = [](int64_t n, int64_t base) {
+            std::vector<int32_t> v((size_t) n);
+            for (int64_t i = 0; i < n; ++i) v[(size_t) i] = (int32_t) (base + i);
+            return v;
+        };
+        auto cat = [](std::vector<int32_t> x, const std::vector<int32_t>& y) {
+            x.insert(x.end(), y.begin(), y.end());
+            return x;
+        };
+        const auto root = ids(10, 1);
+        strata::core::ConversationCache cache((size_t) (2.2 * S), 4);
+        cache.put(sized(ids(5, 900), {ids(3, 900)}, true, 1));            // E1: pinned, S bytes (never the root)
+        cache.put(sized(cat(root, ids(90, 1000)), {root}, false, 1));     // R: superseded shape, S bytes
+        const auto n_img = sized(cat(root, ids(50, 5000)), {root}, false, 2);   // the restore: 2S bytes, holds root
+        const size_t su0 = cache.superseded();
+        const bool ok = cache.put(sized(cat(root, ids(50, 5000)), {root}, false, 2));
+        check(!ok && cache.superseded() == su0 + 1 && cache.size() == 1,
+              "a refused put still superseded on its way in - the restore logs the delta on BOTH legs (F2)");
     }
 
     std::printf("%s\n", g_fail == 0 ? "ALL OK" : "FAILURES");

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# spill-restore-test.sh v2 — G3 WINDOW ONLY (PRECONDITION: prod stopped, :8001 free - enforced below).
+# spill-restore-test.sh v3 — G3 WINDOW ONLY (PRECONDITION: prod stopped, :8001 free - enforced below).
 # Proves PLAN-spill-restore.md §4: a spilled conversation is RESTORED from disk mid-run when its thread is
 # re-requested. Rebuilt after independent review #2 (all 10 findings): short fillers (giants destroyed the
 # newest-2 candidate cap), count-delta precondition, 400-token growth margin for A2, THE <20% WALL ASSERT
 # actually measured (own cold baseline turn), prod-guard + boot short-circuit, post-restart phase scripted.
+# v3 adds review #2's N4: the H3 stdout assertion - NO 'SESSION' protocol line may appear in the engine's
+# stdout log across the A2 turn (boot's PARKLOAD SESSIONs are baselined away; any NEW one is a mid-request leak).
 # Total window cost ~30 min (A1 + B1 + 2 shorts + A2 + BASE cold-giant ≈ 3.5 giants; I2's Z1 is a 4th).
 set -uo pipefail
 MODE=${1:-full}
@@ -48,7 +50,7 @@ GROW="Now, as a final instruction for the archive, do three things. First, state
 check_I1(){ local tag=$1 want=$2
   local N=$(restore_count) ANS=$(cat $R/ans-$tag.txt) OK
   grep -qa "$want" $R/ans-$tag.txt && ANSOK=yes || ANSOK=BAD
-  if [ "$N" -ge 1 ] && [ "$ANSOK" = yes ]; then OK=yes; else OK=no; fi
+  if [ "$N" -ge 1 ] && [ "$ANSOK" = yes ] && [ "${H3_LEAK:-no}" != yes ]; then OK=yes; else OK=no; fi
   local W2=$(cat $R/wall-$tag.txt 2>/dev/null || echo 9999) WB=$(cat $R/wall-BASE.txt 2>/dev/null || echo 9999)
   local FAST=NA; [ "$WB" != 9999 ] && { [ "$W2" -lt $((WB/5)) ] && FAST=yes || FAST=no; }
   REST_OK=$([ "$OK" = yes ] && [ "$FAST" = yes ] && echo PASS || echo "$OK(ans=$ANSOK restores=$N wall=$W2 vs cold $WB fast=$FAST)")
@@ -102,7 +104,12 @@ else say "I1 PRECONDITION FAIL: no new spill at B1 - budget admitted A1 (shrink 
 turn F1 FILLER001 F-1
 turn F2 FILLER002 F-2                          # short: parkable, NEVER spills, never enters candidate set
 
+SOUT=/home/naz/.local/state/strata/launch/strata-serve.stdout.log   # engine stdout (SESSION protocol lines land here)
+SESS0=$(grep -ac '^SESSION ' $SOUT 2>/dev/null); SESS0=${SESS0:-0}
 turn A2 SALTR001 RST-A-741 "$GROW"             # grown re-request: cache has F1/F2 (+maybe B1); A1 exists only on disk
+SESS1=$(grep -ac '^SESSION ' $SOUT 2>/dev/null); SESS1=${SESS1:-0}
+H3_LEAK=no; [ "$SESS1" -gt "$SESS0" ] && H3_LEAK=yes
+say "H3 stdout isolation across A2: SESSION lines $SESS0 -> $SESS1 ($([ $H3_LEAK = yes ] && echo LEAK-FAIL || echo clean))"
 turn BASE SALTBASE9 RST-BASE-0 "ignore the above code question and simply print the word COLD."   # cold baseline (unique salt, giant) - AFTER A2 so it cannot perturb candidates
 check_I1 A2 RST-A-741
 
@@ -118,6 +125,6 @@ tail -6 $PARK/park.manifest | sed 's/^/    /'
 say "I3 NEXT (window step): restart with the SAME config, then run:  bash $0 post-restart"
 
 echo "== SUMMARY =="
-echo "I1 (restore fires + correct + <20% of cold): $REST_OK"
+echo "I1 (restore fires + correct + <20% of cold + no SESSION leak): $REST_OK"
 echo "I2 declines: $(cat $R/declines.txt)"
 echo "I3: run the restart + post-restart phase to close the matrix"

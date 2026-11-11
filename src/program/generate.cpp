@@ -15246,11 +15246,28 @@ int main(int argc, char** argv) {
                     const long long restore_min_free = o.conversation_cache_min_free_mib;
                     const uint64_t restore_floor = (uint64_t) restore_min_free << 20;
                     const uint64_t restore_max_ctx = (uint64_t) o.max_context;
+                    // N3 (review #2): the manifest-header refusals are a property of the DIRECTORY, not of a
+                    // request - say them once per installation instead of on every shallow-floor cold request
+                    // (a stale-tag park dir would otherwise spam stderr for 48 h); the silent fall-through to
+                    // cold is the same either way.
+                    auto restore_warned = std::make_shared<bool>(false);
+                    auto warn_once = [restore_warned](const std::string& line) {
+                        if (*restore_warned) return;
+                        *restore_warned = true;
+                        std::fprintf(stderr, "strata serve: spill restore: %s (later refusals of this kind stay silent)\n",
+                                     line.c_str());
+                    };
                     park_restore_fn = [restore_dir, restore_manifest, restore_tag, restore_id, restore_st, restore_gain,
                                        restore_tries, restore_cap, restore_age_s, restore_floor, restore_min_free,
-                                       restore_max_ctx, &conversations, &stages, &ss, &g, &mtp, &use_mtp, &mtp_first](
+                                       restore_max_ctx, restore_warned, warn_once, &conversations, &stages, &ss, &g, &mtp,
+                                       &use_mtp, &mtp_first](
                                       const std::vector<int64_t>& ids, const std::vector<ImgKey>& req_imgs,
                                       bool want_cvec, int64_t floor_tokens) -> bool {
+                        // #752's doctrine applies DOUBLED here: this code runs only when the OS is short on RAM
+                        // (a spill exists because admission refused it), so a host OOM is exactly what it will
+                        // meet - it must skip restoring, never end the server. park_current wraps itself the same
+                        // way for the same reason; the whole body is the guarded region.
+                        try {
                         const auto t0 = Clock::now();
                         auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                         // every offered candidate that fails has a NAMED decline (the reasons units and the G3
@@ -15271,19 +15288,17 @@ int main(int argc, char** argv) {
                         std::vector<strata::program::park_restore::Line> lines;
                         std::string why;
                         if (!strata::program::park_restore::parse_manifest(all.str(), mh, lines, why)) {
-                            std::fprintf(stderr, "strata serve: spill restore: %s: %s; no candidates\n",
-                                         restore_manifest.c_str(), why.c_str());
+                            warn_once(std::string(restore_manifest) + ": " + why + "; no candidates");
                             return false;
                         }
                         if (mh.tag != restore_tag) {   // another engine file or STRATA_* set: the boot load says the same
-                            std::fprintf(stderr, "strata serve: spill restore: %s was saved by another engine file or "
-                                         "STRATA_* switch set (tag %s, this one %s); no candidates\n",
-                                         restore_manifest.c_str(), mh.tag.c_str(), restore_tag.c_str());
+                            warn_once(restore_manifest + " was saved by another engine file or STRATA_* switch set "
+                                      "(tag " + mh.tag + ", this one " + restore_tag + "); no candidates");
                             return false;
                         }
                         if (mh.stages != restore_st + 1) {
-                            std::fprintf(stderr, "strata serve: spill restore: the parked files have %llu stages, this "
-                                         "engine %zu; no candidates\n", (unsigned long long) mh.stages, restore_st + 1);
+                            warn_once("the parked files have " + std::to_string(mh.stages) + " stages, this engine " +
+                                      std::to_string(restore_st + 1) + "; no candidates");
                             return false;
                         }
                         const int64_t now_unix = (int64_t) std::chrono::duration_cast<std::chrono::seconds>(
@@ -15471,20 +15486,30 @@ int main(int argc, char** argv) {
                             // hazard pinned by the fork's own supersede test). Boot counted its puts' fallout
                             // around the puts so its summary could never be a lie; the restore does the same.
                             const size_t ev0 = conversations.evictions(), su0 = conversations.superseded();
-                            if (!conversations.put(std::move(image))) { declined(c->name, "admit-refused"); continue; }
+                            const bool placed = conversations.put(std::move(image));
                             const size_t dv = conversations.evictions() - ev0, ds = conversations.superseded() - su0;
+                            // F2 (review #2): put() drops superseded entries BEFORE make_room can still refuse it -
+                            // a REFUSED put's collateral damage is equally real, and it must not become the M2
+                            // silence through an unlogged branch. The delta is counted across the call, not the win.
+                            const std::string fallout = (dv || ds)
+                                            ? ("; the restore itself " + std::to_string(dv) + " evicted, " +
+                                               std::to_string(ds) + " superseded")
+                                            : std::string();
+                            if (!placed) { declined(c->name, "admit-refused" + fallout); continue; }
                             const int64_t got = conversations.best(ids, req_imgs, want_cvec).tokens;
                             std::fprintf(stderr, "strata serve: spill restore: %s (%lld tokens) loaded in %.1f ms - "
-                                         "%lld tokens reused%s%s\n", c->name.c_str(), (long long) c->tokens, ms(),
-                                         (long long) got, (dv || ds) ? "; the restore itself" : "",
-                                         (dv || ds)
-                                             ? (std::to_string(dv) + " evicted, " + std::to_string(ds) + " superseded").c_str()
-                                             : "");
+                                         "%lld tokens reused%s\n", c->name.c_str(), (long long) c->tokens, ms(),
+                                         (long long) got, fallout.c_str());
                             // stop at the FIRST success: the ranking offered the newest-deepest generation first,
                             // and reading an older one over the entry this request just won could supersede it
                             return true;
                         }
                         return false;
+                        } catch (const std::bad_alloc&) {
+                            std::fprintf(stderr, "strata serve: spill restore: out of memory while reading "
+                                         "candidates; this request reads its prompt\n");
+                            return false;
+                        }
                     };
                 }
                 if (save) {
