@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spill-restore-test.sh v5 — G3 WINDOW ONLY (PRECONDITION: prod stopped, :8001 free - enforced below).
+# spill-restore-test.sh v6 — G3 WINDOW ONLY (PRECONDITION: prod stopped, :8001 free - enforced below).
 # Proves PLAN-spill-restore.md §4: a spilled conversation is RESTORED from disk mid-run when its thread is
 # re-requested. Lineage: v2 = review #2 (FIX-BEFORE-WINDOW, all 10 findings); v4/v4.1 = real-class size +
 # /dev/shm RAM holder; v5 = the THREAD SHAPE the mechanism actually serves.
@@ -13,7 +13,12 @@
 # spilling, and the grown A2 request must reuse the deepest turn-boundary checkpoint (~150 K) and read only
 # the tail. Z1 is sized 200 K so A's young lines (tk ~168 K) are guaranteed IN-WINDOW candidates for it -
 # which the pre-screen must name-decline (the I2 proof v4.1 could not exercise: same-size siblings fall
-# silently outside the strict upper bound).
+# silently outside the strict upper bound). PROVEN v5: Z1 named A's line declined (pre-screen) in ms.
+# v6: A2/A3 grow the thread the way REAL clients do - replay the full history INCLUDING the assistant's
+# last answer and append a NEW user message - so the spilled conversation's LIVE state is a prefix of the
+# request and reuse runs deep (v5 appended inside the last user message, which diverges before every
+# serialized state but the periodic root stamp: got=16384, correct-but-pointless). Also: FILLER turns are
+# short again (v5's rewrite regressed them into 165 K giants - review #2's finding 1, re-earning its lesson).
 #
 # The spill leg is forced deterministically with a 2 GiB /dev/shm RAM holder across A1X's park (mirroring
 # the real-traffic MemAvailable pressure that produced the night's spills; park REFUSES admission, the spill
@@ -43,16 +48,24 @@ holder(){ # "holder on <MiB>" / "holder off": shrink or restore MemAvailable (fo
     say "RAM holder OFF (avail now $(avail_mib) MiB)"
   fi; }
 
-body(){ python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$R/body.json" <<'PY'
+body(){ python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$R" "$R/body.json" <<'PY'
 import json,sys
-salt,code,extra,target,mode,ansfile,out = sys.argv[1:8]
+salt,code,extra,target,mode,ansfile,R_,out = sys.argv[1:9]
+if salt.startswith("FILLER"):
+    json.dump({"model":"strata","messages":[{"role":"user","content":salt+"\nShort filler: name three moons of Jupiter, one line."}],
+               "max_tokens":256,"temperature":0},open(out,"w")); sys.exit()
 corpus=open('/mnt/scratch/naz/Projects/llama-cache-dir/runs/ab-220-275u-curve/pp.txt').read()*4
 corpus=corpus[:int(int(target)/0.39818)]
 user1=salt+"\n"+corpus+f"\n\nREMEMBER: the shipment code is {code}. When asked, reply with exactly the code and nothing else.\nQuestion: what is the shipment code?\n"
-if mode=="multi":
+user2="Restate the identifier and the date 2026-11-11 on separate lines, identifier first."
+if mode=="multi2":
     assistant=open(ansfile).read()
-    user2="Restate the identifier and the date 2026-11-11 on separate lines, identifier first."+("\n"+extra if extra else "")
     msgs=[{"role":"user","content":user1},{"role":"assistant","content":assistant},{"role":"user","content":user2}]
+elif mode=="grown":
+    a1=open(R_+"/full-A1.txt").read(); a2=open(R_+"/full-A1X.txt").read()
+    msgs=[{"role":"user","content":user1},{"role":"assistant","content":a1},
+          {"role":"user","content":user2},{"role":"assistant","content":a2},
+          {"role":"user","content":extra}]
 else:
     text=user1+("\n"+extra if extra else "")
     msgs=[{"role":"user","content":text}]
@@ -89,7 +102,7 @@ if [ "$MODE" = post-restart ]; then
   health || { say "FATAL: :8001 not healthy - start the restoretest config first"; exit 1; }
   [ -f $R/wall-BASE.txt ] || echo 9999 > $R/wall-BASE.txt
   SESS0=$(grep -ac '^SESSION ' /home/naz/.local/state/strata/launch/strata-serve.stdout.log 2>/dev/null); SESS0=${SESS0:-0}
-  turn A3 SALTR001 RST-A-741 "$GROW" 165000 multi
+  turn A3 SALTR001 RST-A-741 "$GROW" 165000 grown
   SOUT=/home/naz/.local/state/strata/launch/strata-serve.stdout.log
   SESS1=$(grep -ac '^SESSION ' $SOUT 2>/dev/null); SESS1=${SESS1:-0}
   H3_LEAK=no; [ "$SESS1" -gt "$SESS0" ] && H3_LEAK=yes
@@ -125,7 +138,7 @@ say "booted+healthy (marker: /health poll; avail $(avail_mib) MiB)"
 
 # ---- I1: thread A turns 1+2 -> holder ON -> B1 (A1X spills) -> shorts -> holder OFF -> grown A2 restores ----
 turn A1 SALTR001 RST-A-741 "" 165000 single
-turn A1X SALTR001 RST-A-741 "Restate the identifier and the date 2026-11-11 on separate lines, identifier first." 165000 multi
+turn A1X SALTR001 RST-A-741 "" 165000 multi2
 P0=$(spill_count)
 holder on 2048                                  # A1X's park will refuse admission -> spills (capture rides reclaimable cache by design)
 turn B1 SALTR002 RST-B-741                      # outgoing thread-A conversation cannot be admitted -> spills
@@ -139,7 +152,7 @@ holder off                                      # A2's restore read must admit (
 
 SOUT=/home/naz/.local/state/strata/launch/strata-serve.stdout.log
 SESS0=$(grep -ac '^SESSION ' $SOUT 2>/dev/null); SESS0=${SESS0:-0}
-turn A2 SALTR001 RST-A-741 "$GROW" 165000 multi  # grown re-request: thread A exists ONLY on disk (or evicted RAM)
+turn A2 SALTR001 RST-A-741 "$GROW" 165000 grown  # real-client replay: full history + NEW user message
 SESS1=$(grep -ac '^SESSION ' $SOUT 2>/dev/null); SESS1=${SESS1:-0}
 H3_LEAK=no; [ "$SESS1" -gt "$SESS0" ] && H3_LEAK=yes
 say "H3 stdout isolation across A2: SESSION lines $SESS0 -> $SESS1 ($([ $H3_LEAK = yes ] && echo LEAK-FAIL || echo clean))"
