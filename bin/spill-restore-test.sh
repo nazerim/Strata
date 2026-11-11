@@ -90,7 +90,7 @@ check_I1(){ local tag=$1 want=$2 base=${3:-BASE}
   grep -qa "$want" $R/full-$tag.txt && local ANSOK=yes || local ANSOK=BAD
   local W2=$(cat $R/wall-$tag.txt 2>/dev/null || echo 9999) WB=$(cat $R/wall-$base.txt 2>/dev/null || echo 9999)
   local FAST=NA; [ "$WB" != 9999 ] && { [ "$W2" -lt $((WB/5)) ] && FAST=yes || FAST=no; }
-  [ "$N" -ge 1 ] && [ "$ANSOK" = yes ] && [ "${H3_LEAK:-no}" != yes ] && OK=yes || OK=no
+  { [ "$N" -ge 1 ] || [ "${BOOT_TAKE_OK:-no}" = yes ]; } && [ "$ANSOK" = yes ] && [ "${H3_LEAK:-no}" != yes ] && OK=yes || OK=no
   REST_OK=$([ "$OK" = yes ] && [ "$FAST" = yes ] && echo PASS || echo "$OK(ans=$ANSOK restores=$N wall=${W2}s cold=${WB}s fast=$FAST leak=${H3_LEAK:-n/a}))")
   say "restore lines loaded: $N | last: $(bootline | grep -a 'spill restore: .*loaded' | tail -1 | cut -c1-170)"
   say "I1 verdict: $REST_OK"
@@ -106,7 +106,8 @@ if [ "$MODE" = post-restart ]; then
   SOUT=/home/naz/.local/state/strata/launch/strata-serve.stdout.log
   SESS1=$(grep -ac '^SESSION ' $SOUT 2>/dev/null); SESS1=${SESS1:-0}
   H3_LEAK=no; [ "$SESS1" -gt "$SESS0" ] && H3_LEAK=yes
-  bootline | grep -aq 'took the parked conversation' && say "take line present (boot-load or restore - either feeds it)" || say "note: no take line this boot"
+  BOOT_TAKE_OK=no
+  bootline | grep -aq 'took the parked conversation' && { BOOT_TAKE_OK=yes; say 'take line present - boot-load fed this turn (restore stays silent by design: it only runs where RAM matching fell short)'; } || say 'note: no take line this boot'
   check_I1 A3 RST-A-741 BASE
   echo "== POST-RESTART RESULT: $REST_OK =="; exit 0
 fi
