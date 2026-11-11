@@ -228,6 +228,12 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
   target_include_directories(session_save_reclaim_test PRIVATE include)
   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
+  # park-restore (STRATA_PARK_RESTORE=1): the manifest/candidate/pre-screen decision rules and the put
+  # side effects a restore inherits - the window bounds, the depth prebound, the grown-thread case and
+  # the supersede delta review #1 required (header-only, CPU)
+  add_executable(park_restore_test src/program/park_restore_test.cpp)
+  target_include_directories(park_restore_test PRIVATE include)
+  add_test(NAME park_restore_test COMMAND park_restore_test)
 endif()
 
 if(STRATA_HIP_GFX906)
