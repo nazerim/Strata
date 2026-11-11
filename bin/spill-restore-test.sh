@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# spill-restore-test.sh v6 — G3 WINDOW ONLY (PRECONDITION: prod stopped, :8001 free - enforced below).
+# spill-restore-test.sh v6.1 — G3 WINDOW ONLY.
+# OPER NOTE (audit 2026-11-11): run the post-restart phase under tee INTO out/ (that phase's
+# PASS existed only in the engine log this window - transcript hygiene). (PRECONDITION: prod stopped, :8001 free - enforced below).
 # Proves PLAN-spill-restore.md §4: a spilled conversation is RESTORED from disk mid-run when its thread is
 # re-requested. Lineage: v2 = review #2 (FIX-BEFORE-WINDOW, all 10 findings); v4/v4.1 = real-class size +
 # /dev/shm RAM holder; v5 = the THREAD SHAPE the mechanism actually serves.
