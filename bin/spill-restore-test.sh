@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# spill-restore-test.sh v3 — G3 WINDOW ONLY (PRECONDITION: prod stopped, :8001 free - enforced below).
+# spill-restore-test.sh v4 — G3 WINDOW ONLY (PRECONDITION: prod stopped, :8001 free - enforced below).
 # Proves PLAN-spill-restore.md §4: a spilled conversation is RESTORED from disk mid-run when its thread is
 # re-requested. Rebuilt after independent review #2 (all 10 findings): short fillers (giants destroyed the
 # newest-2 candidate cap), count-delta precondition, 400-token growth margin for A2, THE <20% WALL ASSERT
 # actually measured (own cold baseline turn), prod-guard + boot short-circuit, post-restart phase scripted.
-# v3 adds review #2's N4: the H3 stdout assertion - NO 'SESSION' protocol line may appear in the engine's
+# v4 (after the v3 full-phase RED): the 380 K class is PHYSICALLY out of mid-run restore range on this box
+# (stage-0 = 4106 MiB > steady MemAvailable - floor; the declined read named itself exactly that, and fell
+# through to cold as spec §6(4) predicted). I1 now runs at 165 K - the REAL spilled class (prod traffic
+# spilled 170242/170908/313867) - and forces the spill deterministically with a /dev/shm RAM holder during
+# B1's admission (mirroring the real-traffic pressure), released before A2 so the ~1.8 GiB restore read
+# admits. v3 adds review #2's N4: the H3 stdout assertion - NO 'SESSION' protocol line may appear in the engine's
 # stdout log across the A2 turn (boot's PARKLOAD SESSIONs are baselined away; any NEW one is a mid-request leak).
 # Total window cost ~30 min (A1 + B1 + 2 shorts + A2 + BASE cold-giant ≈ 3.5 giants; I2's Z1 is a 4th).
 set -uo pipefail
@@ -31,7 +36,7 @@ if salt.startswith("FILLER"):                       # SHORT by intent (review #2
     text=salt+"\n"+"Short filler "+salt[-1]+": name three moons of Jupiter, one line."   # negative path (fits RAM
 else:                                               # -> must NEVER spill; must never enter A2's candidate set
     corpus=open('/mnt/scratch/naz/Projects/llama-cache-dir/runs/ab-220-275u-curve/pp.txt').read()*4
-    text=salt+"\n"+corpus[:int(380000/0.39818)]+f"\n\nREMEMBER: the shipment code is {code}. When asked, reply with exactly the code and nothing else.\nQuestion: what is the shipment code?\n"
+    text=salt+"\n"+corpus[:int(165000/0.39818)]+f"\n\nREMEMBER: the shipment code is {code}. When asked, reply with exactly the code and nothing else.\nQuestion: what is the shipment code?\n"
 if extra: text += "\n" + extra                       # A2's growth passage (~400 tokens, finding 3)
 json.dump({"model":"strata","messages":[{"role":"user","content":text}],"max_tokens":256,"temperature":0},open(sys.argv[4],"w"))
 PY
@@ -46,6 +51,13 @@ turn(){ local tag=$1 salt=$2 code=$3 extra=${4:-}
 }
 # ~300-token growth passage so request_len - tk(A1) lands >> assistant-turn framing noise (finding 3), << 16384
 GROW="Now, as a final instruction for the archive, do three things. First, state the shipment code once more, exactly, followed by the date 2026-11-11. Second, list four procedural safeguards a warehouse should apply when a coded shipment crosses a jurisdictional boundary, each in one numbered sentence. Third, write a two-sentence summary of why deterministic recall of coded identifiers matters more for audit chains than for routine logistics, and close by repeating the identifier alone on the final line. Please be brief and factual, and remember that the response will be checked by an automated verifier that compares tokens literally, so punctuation and casing of the identifier must match what you were told earlier, character for character, with no surrounding quotation marks or commentary on the same final line as the identifier itself. The archive format expects the identifier to appear exactly twice in the whole response: once in the first sentence of the restated form and once alone on the final line. Any deviation, paraphrase, expansion, or additional occurrence will fail verification and trigger a costly manual review cycle. This instruction block was appended to the thread after the original conversation and represents the grown request the restore path must serve from disk state plus a new tail."
+
+holder(){ # on <MiB>: shrink MemAvailable (forces RAM admission refusal at the next park -> spill)
+  if [ "$2" = on ]; then dd if=/dev/zero of=/dev/shm/g3-holder bs=1M count=$1 status=none
+    say "RAM holder ON: $1 MiB in /dev/shm (avail now $(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo) MiB)"
+  else rm -f /dev/shm/g3-holder
+    say "RAM holder OFF (avail now $(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo) MiB)"
+  fi; }
 
 check_I1(){ local tag=$1 want=$2
   local N=$(restore_count) ANS=$(cat $R/ans-$tag.txt) OK
@@ -96,6 +108,7 @@ say "booted+healthy (marker: /health poll)"
 # ---- I1: A1 -> B1 (count-delta proves A's spill) -> 2 SHORT fillers -> grown A2 must restore from disk ----
 turn A1 SALTR001 RST-A-741
 P0=$(spill_count)
+holder on 2048                                 # avail < need+floor at A1's park => RAM admission refuses => spills
 turn B1 SALTR002 RST-B-741                    # outgoing A1 cannot be admitted -> spills (the only way to get
 SP1=$(spill_count)                            # a spill line here is A1: B1 becomes active, nothing else exists)
 if [ "$SP1" -gt "$P0" ] && bootline | grep -a 'conversation cache: spilled' | tail -1 | grep -aq 'as c'; then
@@ -103,6 +116,7 @@ if [ "$SP1" -gt "$P0" ] && bootline | grep -a 'conversation cache: spilled' | ta
 else say "I1 PRECONDITION FAIL: no new spill at B1 - budget admitted A1 (shrink --conversation-cache-mib in a copy config and re-run)"; exit 1; fi
 turn F1 FILLER001 F-1
 turn F2 FILLER002 F-2                          # short: parkable, NEVER spills, never enters candidate set
+holder off
 
 SOUT=/home/naz/.local/state/strata/launch/strata-serve.stdout.log   # engine stdout (SESSION protocol lines land here)
 SESS0=$(grep -ac '^SESSION ' $SOUT 2>/dev/null); SESS0=${SESS0:-0}
