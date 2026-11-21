@@ -1534,8 +1534,6 @@ class StrataEngine:
                     except OSError:
                         pass
                 return
-        elif not os.path.exists(os.path.join(self.PARK_DIR, "park.manifest")):
-            return
         try:
             r = self.session_file("parkload", self.PARK_DIR)
             where = f"RAM (keeper PID {keeper['pid']})" if keeper else self.PARK_DIR
