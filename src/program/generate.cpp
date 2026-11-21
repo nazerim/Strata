@@ -12209,6 +12209,10 @@ int main(int argc, char** argv) {
             });
         };
         pool_topup();   // the first request's checkpoints find the pool full
+        // set only while PARKSAVE's own live-park runs (the stop): make_room/evict_oldest/put then take only entries
+        // the disk already holds, so capturing the live conversation can never evict an unsaved parked one that the
+        // save walk has not written yet (stop-path eviction protection)
+        bool park_stop_context = false;
         auto park_source = [&](const ParkSource& src, size_t held) -> bool {
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
@@ -12307,7 +12311,7 @@ int main(int argc, char** argv) {
             // estimate must stay uncapped: it counts the retained buffers'
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
-            if (!conversations.make_room(estimate, held)) {
+            if (!conversations.make_room(estimate, held, park_stop_context)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
                 return true;
@@ -12337,7 +12341,7 @@ int main(int argc, char** argv) {
                 };
                 bool fits = admit() || (strata::core::release_free_heap() && admit());
                 while (!fits && conversations.size() > 0 && evicted < conversations.slots() &&
-                       conversations.evict_oldest()) {
+                       conversations.evict_oldest(park_stop_context)) {
                     ++evicted;
                     fits = admit();
                 }
@@ -12399,7 +12403,7 @@ int main(int argc, char** argv) {
                 const size_t snapshot_bytes = image.bytes();
                 image.parked_unix = (int64_t) std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();   // PARKSAVE's age limit (STRATA_PARK_MAX_AGE_H)
-                const bool stored = conversations.put(std::move(image), held);
+                const bool stored = conversations.put(std::move(image), held, park_stop_context);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -15749,7 +15753,11 @@ int main(int argc, char** argv) {
                     return !mtp_first && s == n_st ? &mtp.kv_state() : nullptr;
                 };
                 if (save) {
-                    if (live_ok && !live.empty() && !park_current(0)) {
+                    park_stop_context = true;   // the live-park must evict only what the disk already holds
+                    bool parked_live_ok = true;
+                    if (live_ok && !live.empty()) parked_live_ok = park_current(0);
+                    park_stop_context = false;
+                    if (!parked_live_ok) {
                         std::fprintf(stderr, "strata serve: park save: the live conversation could not be parked (%s); "
                                      "saving the others\n", err.c_str());
                         err.clear();

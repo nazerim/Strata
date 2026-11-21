@@ -767,5 +767,15 @@ int main() {
         check(cache.put(std::move(other)) && cache.size() == 1 && cache.superseded() == 1,
               "the second silently supersedes the first - the live tail is lost (the documented hazard)");
     }
+    {
+        // stop-path eviction protection (saved_only): at a full one-slot cache, the stop's live-park asks for room
+        // with saved_only set; the only entry is one the disk does not hold, so it must be refused, not evicted
+        ConversationCache cache(1u << 24, 1);
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        SavedConversation unsaved = image({1, 2, 3, 4}); unsaved.checkpoints = {cp({1, 2})};
+        SavedConversation live = image({1, 2, 3, 5, 6}); live.checkpoints = {cp({1, 2})};
+        check(cache.put(std::move(unsaved)) && !cache.make_room(live.bytes(), 0, true) && cache.size() == 1,
+              "stop live-park at a full cache refuses rather than evicting an entry the disk does not hold");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

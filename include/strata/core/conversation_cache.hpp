@@ -404,9 +404,16 @@ public:
 
     // Reserve before allocating a snapshot. held is an incoming image removed
     // with take() but still alive during the exchange; count it against RAM too.
-    bool make_room(size_t incoming, size_t held = 0) {
+    // saved_only (stop-path eviction protection): at a graceful stop the LIVE image is parked before the save walk
+    // runs, and an unsaved parked entry is that walk's own save target - the stop's live-park must not evict it.
+    // With saved_only, only entries the disk already holds (see saved_for_evict) are evictable; if that is not
+    // enough room, the incoming image is refused. Mid-run (saved_only = false) keeps the LRU eviction.
+    bool make_room(size_t incoming, size_t held = 0, bool saved_only = false) {
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
-        auto stays = [&](size_t i) { return entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_); };
+        auto stays = [&](size_t i) {
+            return entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)
+                || (saved_only && !saved_for_evict(entries_[i]));
+        };
         if (guarded_ != 0 && index_of(guarded_) != SIZE_MAX) {
             // with everything else gone, would it fit beside the entries that stay (the guarded donor and any pinned
             // shared prefix)?  If not, evict nothing
@@ -419,10 +426,15 @@ public:
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
-            if (!drop_oldest()) return false;
+            if (!drop_oldest(saved_only)) return false;
         }
         return true;
     }
+
+    // Whether the disk already holds this entry's files: its disk_name is set when the stop-save walk wrote it or
+    // when it was loaded from the park directory (generate.cpp sets it in both places). An entry without one has
+    // only its RAM copy, so it is evictable only mid-run, never to make room for the stop's own live image.
+    static bool saved_for_evict(const SavedConversation& e) { return !e.disk_name.empty(); }
 
     // The parked conversation that has gone unused the longest, for the callers that free RAM one entry at a time
     // and read MemAvailable after each (the physical-RAM admission gate in generate.cpp, session_save_reclaim).
@@ -432,8 +444,8 @@ public:
     // is handed back here (release_free_heap).  make_room() drops entries without it: its room is for the image
     // that is allocated right after, which reuses that memory.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
-    bool evict_oldest() {
-        if (!drop_oldest()) return false;
+    bool evict_oldest(bool saved_only = false) {
+        if (!drop_oldest(saved_only)) return false;
         release_free_heap();
         return true;
     }
@@ -538,11 +550,13 @@ public:
         return longest;
     }
 
-    bool put(SavedConversation&& image, size_t held = 0) {
+    // saved_only: the stop's live-park re-runs make_room here too (the capture can outgrow the estimate that passed
+    // the gate earlier), so the flag must reach this internal call as well or it is a back door to evicting unsaved.
+    bool put(SavedConversation&& image, size_t held = 0, bool saved_only = false) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
-        if (!make_room(n, held)) return false;
+        if (!make_room(n, held, saved_only)) return false;
         entries_.push_back(std::move(image));
         serials_.push_back(next_serial_++);
         bytes_ += n;
@@ -551,10 +565,11 @@ public:
 
 private:
     // evict_oldest() without handing the memory back (make_room's loop)
-    bool drop_oldest() {
+    bool drop_oldest(bool saved_only = false) {
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            if (saved_only && !saved_for_evict(entries_[i])) continue;   // stop-time: unsaved ones are the walk's own
             bytes_ -= entries_[i].bytes();
             erase(i);
             ++evictions_;
