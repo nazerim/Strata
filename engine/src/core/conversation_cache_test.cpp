@@ -994,6 +994,34 @@ int main() {
         check(big.size() == 4, "every parked conversation is still there");
         check(big.best(std::vector<int64_t>{1, 2}, {}, true).tokens == 1, "including the unsaved one");
 
+        // --- shortfall ONE byte past the saved-only total: the case that discriminates the filter -----------
+        // The 2x case above exceeds even the unfiltered total, so an unfiltered gate would refuse it too.  Here the
+        // shortfall is strictly above what the stop may evict and strictly below everything parked, so ONLY the
+        // filter separates the two paths: stop ON refuses without evicting, stop OFF reclaims (the unsaved oldest
+        // entry is eligible there).  Reverting generate.cpp's evictable_bytes(park_stop_context) argument to the
+        // unfiltered total makes the stop-ON assertions below fail.
+        ConversationCache edge(1u << 20, 8);
+        edge.put(entry({1}, 32, false));
+        edge.put(entry({2}, 48, true));
+        edge.put(entry({3, 4}, 96, true));
+        edge.put(entry({5, 6, 7}, 160, true));
+        const uint64_t edge_short = (uint64_t) edge.evictable_bytes(true) + 1;
+        check(edge_short < (uint64_t) edge.bytes(), "one byte past the saved-only total is still below the unfiltered total");
+        const strata::core::EvictForRam edge_stop = run_gate(edge, true, edge_short, 0);
+        check(!edge_stop.fits, "stop, short one byte past the saved-only total: the gate does not report success");
+        check(edge_stop.cannot_help, "stop: the #2253 shortcut fires on the saved-only total");
+        check(edge_stop.evicted == 0, "stop: nothing was evicted");
+        check(edge.size() == 4, "stop: every parked conversation is still there");
+        ConversationCache edge_off(1u << 20, 8);
+        edge_off.put(entry({1}, 32, false));
+        edge_off.put(entry({2}, 48, true));
+        edge_off.put(entry({3, 4}, 96, true));
+        edge_off.put(entry({5, 6, 7}, 160, true));
+        const strata::core::EvictForRam edge_mid = run_gate(edge_off, false, edge_short, 0);
+        check(edge_mid.fits && !edge_mid.cannot_help, "stop off, same shortfall: reclaimable (the unsaved entry may go)");
+        check(edge_mid.evicted == 4, "stop off: all four entries were needed, the unsaved oldest one included");
+        check(edge_off.size() == 0, "stop off: the cache is emptied to cover it");
+
         // --- the saved-only set covers the shortfall: success, and only saved entries go ------------------
         ConversationCache fits(1u << 20, 8);
         fits.put(entry({1}, 32, false));

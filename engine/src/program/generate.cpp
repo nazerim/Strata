@@ -13861,8 +13861,12 @@ int main(int argc, char** argv) {
                         no_progress = r.no_progress;
                         if (r.cannot_help) {
                             char note[160];
-                            std::snprintf(note, sizeof note, "; short by %llu MiB, more than the %zu parked hold (%zu MiB), so none was evicted",
-                                          (unsigned long long) (r.short_by >> 20), conversations.size(), conversations.evictable_bytes(park_stop_context) >> 20);
+                            if (park_stop_context)   // the stop may evict only the saved entries: say which figure is which
+                                std::snprintf(note, sizeof note, "; short by %llu MiB, more than the %zu MiB evictable here (%zu parked), so none was evicted",
+                                              (unsigned long long) (r.short_by >> 20), conversations.evictable_bytes(park_stop_context) >> 20, conversations.size());
+                            else
+                                std::snprintf(note, sizeof note, "; short by %llu MiB, more than the %zu parked hold (%zu MiB), so none was evicted",
+                                              (unsigned long long) (r.short_by >> 20), conversations.size(), conversations.evictable_bytes() >> 20);
                             cannot_help_note = note;
                         }
                     }
