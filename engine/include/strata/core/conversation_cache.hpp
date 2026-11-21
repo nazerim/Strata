@@ -490,19 +490,26 @@ public:
         release_free_heap();
         return true;
     }
-    /// The bytes the next evict_oldest() frees (0: nothing can go) - for the RAM gate's progress check (evict_for_ram)
-    size_t oldest_evictable_bytes() const {
+    /// The bytes the next evict_oldest() frees (0: nothing can go) - for the RAM gate's progress check (evict_for_ram).
+    /// The stop-time `saved_only` rule has to reach this too (park-spill review F1): the gate measures what it is
+    /// allowed to evict.  Without it a stop whose only reclaimable entries are already on the disk read the bytes of an
+    /// unsaved entry the walk still needs, counted it as reclaimable, and could report progress on an eviction it
+    /// was never allowed to make.  With the flag false the answer is identical to every pre-stop caller.
+    size_t oldest_evictable_bytes(bool saved_only = false) const {
         for (size_t i = 0; i < entries_.size(); ++i)
-            if (!entries_[i].pinned() && !(guarded_ != 0 && serials_[i] == guarded_)) return entries_[i].bytes();
+            if (!entries_[i].pinned() && !(guarded_ != 0 && serials_[i] == guarded_)
+                && !(saved_only && !saved_for_evict(entries_[i]))) return entries_[i].bytes();
         return 0;
     }
     /// #2253 (PR by alanthinker, from Arthur031221's #1394): what evict_oldest() could give back in all - every parked entry
     /// that may go (the same rule as oldest_evictable_bytes: no pinned shared prefix, not the guarded donor).  The RAM gate
-    /// evicts nothing when even all of it would leave the park short.
-    size_t evictable_bytes() const {
+    /// evicts nothing when even all of it would leave the park short.  Same `saved_only` rule as above, and for the same
+    /// reason: the total is only meaningful for the set the caller is allowed to evict.
+    size_t evictable_bytes(bool saved_only = false) const {
         size_t n = 0;
         for (size_t i = 0; i < entries_.size(); ++i)
-            if (!entries_[i].pinned() && !(guarded_ != 0 && serials_[i] == guarded_)) n += entries_[i].bytes();
+            if (!entries_[i].pinned() && !(guarded_ != 0 && serials_[i] == guarded_)
+                && !(saved_only && !saved_for_evict(entries_[i]))) n += entries_[i].bytes();
         return n;    }
 
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them

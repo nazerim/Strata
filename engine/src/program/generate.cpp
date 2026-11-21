@@ -13843,7 +13843,7 @@ int main(int argc, char** argv) {
                         const strata::core::EvictForRam r = strata::core::evict_for_ram(
                             admit, [&] { return mem ? std::optional<uint64_t>(mem->available) : std::nullopt; },
                             [&]() -> size_t {
-                                const size_t b = conversations.oldest_evictable_bytes();
+                                const size_t b = conversations.oldest_evictable_bytes(park_stop_context);
                                 if (b == 0 || !conversations.evict_oldest(park_stop_context)) return 0;
                                 if (spill_writer) {   // (2c: the victim went to the background writer: its memory is back once written)
                                     spill_writer->wait_idle();
@@ -13855,14 +13855,14 @@ int main(int argc, char** argv) {
                             conversations.slots(),
                             // #2253: short by more than every parked conversation that may go holds: none is evicted
                             (uint64_t) additional > UINT64_MAX - floor ? UINT64_MAX : (uint64_t) additional + floor,
-                            (uint64_t) conversations.evictable_bytes());
+                            (uint64_t) conversations.evictable_bytes(park_stop_context));
                         fits = r.fits;
                         evicted = r.evicted;
                         no_progress = r.no_progress;
                         if (r.cannot_help) {
                             char note[160];
                             std::snprintf(note, sizeof note, "; short by %llu MiB, more than the %zu parked hold (%zu MiB), so none was evicted",
-                                          (unsigned long long) (r.short_by >> 20), conversations.size(), conversations.evictable_bytes() >> 20);
+                                          (unsigned long long) (r.short_by >> 20), conversations.size(), conversations.evictable_bytes(park_stop_context) >> 20);
                             cannot_help_note = note;
                         }
                     }
@@ -13874,6 +13874,14 @@ int main(int argc, char** argv) {
                         if (!park_spill_fn) return true;
                         spill_instead = true;
                     }
+                    // (spill review F2: the diagnostic the base carries at c69025f23 - "evicted ... to admit this
+                    // snapshot".  It is what tells an operator that physical RAM was reclaimed by this gate rather
+                    // than by the ordinary budget eviction above; without it a successful eviction is silent.  Only
+                    // on the admission-success leg: the refusal/spill path has its own line.)
+                    if (fits && evicted)
+                        std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
+                                     evicted, evicted == 1 ? "" : "s", additional >> 20,
+                                     (long long) o.conversation_cache_min_free_mib);
                 }
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;

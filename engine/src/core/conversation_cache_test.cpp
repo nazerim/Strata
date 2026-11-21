@@ -1,4 +1,5 @@
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/conversation_memory.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -922,6 +923,117 @@ int main() {
         SavedConversation d = image({6, 6, 6, 6}); d.checkpoints = {cp({6})};
         check(cache.put(std::move(d), 0, true), "stop-context put does evict a disk-held entry");
         check(cache.size() == 1, "and the new image is the one parked");
+    }
+    {
+        // park-spill review F1: the stop-time RAM gate asks three questions of the cache - which entry is the victim
+        // (oldest_evictable_bytes), how many bytes that frees (the same call), and how many bytes could be reclaimed in
+        // all (evictable_bytes) - and the gate's no-progress threshold and #2253 "cannot help" shortcut read the last
+        // two.  All three must use the SAME eligibility rule, so the stop's saved_only has to reach all three, exactly as
+        // it already reached evict_oldest().  Before this, the size of an UNSAVED oldest entry (which the stop may not
+        // evict) was returned as the reclaimable victim, counted in the total, and used for the no-progress threshold.
+        // The flag-off arm below is the pre-fix behaviour, unchanged: prod runs that path on every park.
+        auto entry = [](std::initializer_list<int32_t> ids, size_t gdn, bool saved) {
+            SavedConversation s = image(ids);
+            s.live.gdn.assign(gdn, 7);            // differently sized entries, strictly increasing
+            if (saved) s.disk_name = "c" + std::to_string(ids.size());
+            return s;
+        };
+        // gate, driven exactly as generate.cpp drives it: required = the park's bytes + the floor (admit() is
+        // `available >= required`, the same inequality as conversation_memory_admit with the floor folded in), the
+        // victim/evict lambdas pass the SAME stop flag to both cache calls, and each eviction is shown in the
+        // reading (a real eviction hands the RAM back to MemAvailable; without it no_progress would fire).
+        auto run_gate = [](ConversationCache& c, bool stop, uint64_t required, uint64_t available) {
+            auto avail = [&]() -> std::optional<uint64_t> { return std::optional<uint64_t>(available); };
+            return strata::core::evict_for_ram(
+                [&]() { return available >= required; },
+                avail,
+                [&]() -> size_t {
+                    const size_t b = c.oldest_evictable_bytes(stop);
+                    if (b == 0 || !c.evict_oldest(stop)) return 0;
+                    available += b;
+                    return b;
+                },
+                c.slots(), required, (uint64_t) c.evictable_bytes(stop));
+        };
+
+        // --- stop context ON: the oldest entry is unsaved, and it must not be touched or counted -------------
+        ConversationCache stop(1u << 20, 8);
+        const SavedConversation unsaved = entry({1}, 32, false);
+        const SavedConversation s1 = entry({2}, 48, true);
+        const SavedConversation s2 = entry({3, 4}, 96, true);
+        const SavedConversation s3 = entry({5, 6, 7}, 160, true);
+        check(stop.put(entry({1}, 32, false)), "unsaved oldest parked");
+        check(stop.put(entry({2}, 48, true)), "saved entry #1 parked");
+        check(stop.put(entry({3, 4}, 96, true)), "saved entry #2 parked");
+        check(stop.put(entry({5, 6, 7}, 160, true)), "saved entry #3 parked");
+        check(stop.size() == 4, "all four parked for the stop-time gate");
+        const size_t saved_total = s1.bytes() + s2.bytes() + s3.bytes();
+        check(s1.bytes() < s2.bytes() && s2.bytes() < s3.bytes(), "the saved entries differ in size");
+        check(stop.evictable_bytes(false) == stop.bytes(), "flag off: every entry is reclaimable (pre-fix accounting)");
+        check(stop.evictable_bytes(true) == saved_total, "flag on: the unsaved oldest entry is not counted");
+        check(stop.evictable_bytes(true) < stop.bytes(), "the stop can reclaim strictly less than the cache holds");
+        check(stop.oldest_evictable_bytes(false) == unsaved.bytes(),
+              "flag off: the oldest entry's bytes are the reclaimable victim (pre-fix)");
+        check(stop.oldest_evictable_bytes(true) == s1.bytes(),
+              "flag on: the victim is the oldest SAVED entry, not the unsaved oldest");
+        check(stop.evict_oldest(true) && stop.size() == 3, "the stop evicts the saved victim, not the unsaved one");
+        check(stop.best(std::vector<int64_t>{1, 2}, {}, true).tokens == 1, "the unsaved entry survived the stop eviction");
+        check(stop.oldest_evictable_bytes(true) == s2.bytes(), "the next saved victim is the next size");
+
+        // --- shortfall LARGER than the saved-only total: the gate must not report success -------------------
+        ConversationCache big(1u << 20, 8);
+        big.put(entry({1}, 32, false));
+        big.put(entry({2}, 48, true));
+        big.put(entry({3, 4}, 96, true));
+        big.put(entry({5, 6, 7}, 160, true));
+        const size_t saved_only = big.evictable_bytes(true);
+        const strata::core::EvictForRam hopeless = run_gate(big, true, (uint64_t) saved_only * 2, 0);
+        check(!hopeless.fits, "short by more than the saved-only total: the gate does not report success");
+        check(hopeless.cannot_help, "and it says so (#2253), instead of emptying the cache first");
+        check(hopeless.evicted == 0, "nothing was evicted: the saved set cannot cover the shortfall");
+        check(big.size() == 4, "every parked conversation is still there");
+        check(big.best(std::vector<int64_t>{1, 2}, {}, true).tokens == 1, "including the unsaved one");
+
+        // --- the saved-only set covers the shortfall: success, and only saved entries go ------------------
+        ConversationCache fits(1u << 20, 8);
+        fits.put(entry({1}, 32, false));
+        fits.put(entry({2}, 48, true));
+        fits.put(entry({3, 4}, 96, true));
+        fits.put(entry({5, 6, 7}, 160, true));
+        const size_t reclaimable = fits.evictable_bytes(true);
+        // exactly the saved-only total: the boundary case - it takes ALL three saved evictions to show that much RAM
+        const strata::core::EvictForRam ok = run_gate(fits, true, (uint64_t) reclaimable, 0);
+        check(ok.fits, "short by exactly the saved-only total (the boundary): the gate reports success");
+        check(!ok.cannot_help && !ok.no_progress, "and by eviction alone, not the shortcut");
+        check(ok.evicted == 3, "exactly the three saved entries were evicted");
+        check(fits.size() == 1, "only the unsaved entry is left");
+        check(fits.best(std::vector<int64_t>{1, 2}, {}, true).tokens == 1, "the unsaved entry is still parked");
+
+        // --- flag OFF: byte-for-byte the pre-fix behaviour -----------------------------------------------
+        ConversationCache run(1u << 20, 8);
+        run.put(entry({1}, 32, false));
+        run.put(entry({2}, 48, true));
+        run.put(entry({3, 4}, 96, true));
+        run.put(entry({5, 6, 7}, 160, true));
+        check(run.oldest_evictable_bytes(false) == unsaved.bytes(), "mid-run victim: the oldest entry (unsaved or not)");
+        check(run.evictable_bytes(false) == run.bytes(), "mid-run total: everything parked");
+        const size_t all_bytes = run.bytes();
+        const strata::core::EvictForRam mid = run_gate(run, false, (uint64_t) all_bytes, 0);
+        check(mid.fits, "mid-run: a shortfall the whole cache can cover reports success");
+        check(!mid.cannot_help, "mid-run: no #2253 shortcut (the pre-fix accounting includes every entry)");
+        check(mid.evicted == 4, "mid-run: every entry may go, the unsaved one included");
+        check(run.size() == 0, "mid-run: the cache is empty afterwards, as before the fix");
+        // same shape, but a shortfall no entry could cover: the pre-fix gate reports cannot_help too, and that
+        // total includes the unsaved entry's bytes - i.e. the flag-off numbers are the ones prod has always seen
+        ConversationCache run2(1u << 20, 8);
+        run2.put(entry({1}, 32, false));
+        run2.put(entry({2}, 48, true));
+        run2.put(entry({3, 4}, 96, true));
+        run2.put(entry({5, 6, 7}, 160, true));
+        const strata::core::EvictForRam hopeless_mid = run_gate(run2, false, (uint64_t) run2.bytes() * 2, 0);
+        check(!hopeless_mid.fits && hopeless_mid.cannot_help && hopeless_mid.evicted == 0,
+              "mid-run: an uncoverable shortfall still short-circuits, on the full total");
+        check(run2.size() == 4, "and leaves the cache untouched");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
