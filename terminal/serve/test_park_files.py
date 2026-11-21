@@ -91,14 +91,31 @@ class ParkFiles(unittest.TestCase):
         self.assertEqual(eng.proc.sent[0], f"PARKSAVE {self.dir.name}\n")
         self.assertEqual(self.commands(eng), ["PARKSAVE", "CLOSE"])
 
-    def test_load_only_with_a_manifest(self):
+    def test_load_is_issued_with_a_manifest(self):
         eng = FakeEngine()
         with mock.patch.object(StrataEngine, "PARK_DIR", self.dir.name):
-            eng.park_from_disk()
-            self.assertEqual(eng.proc.sent, [])                 # nothing saved yet
             eng.park_to_disk()
             eng.park_from_disk()
         self.assertEqual(self.commands(eng), ["PARKSAVE", "PARKLOAD"])
+
+    def test_fresh_dir_still_issues_load_at_startup(self):
+        # no park.manifest yet: the engine's PARKLOAD is what installs the spill and restore callbacks (it answers
+        # RESTORED 0 0 for the missing manifest), so the server must still send it - a fresh STRATA_PARK_DIR arms
+        # spill for the whole first process lifetime.  Pins the command the server sends; the callbacks themselves
+        # live in the C++ engine and are not exercised here.
+        eng = FakeEngine()
+        self.assertFalse(Path(self.dir.name, "park.manifest").exists())
+        with mock.patch.object(StrataEngine, "PARK_DIR", self.dir.name):
+            eng.park_from_disk()
+        self.assertEqual(eng.proc.sent, [f"PARKLOAD {self.dir.name}\n"])
+
+    def test_fresh_dir_load_before_any_save(self):
+        # the order at startup: the load is the first command the engine receives, before any save could happen
+        eng = FakeEngine()
+        with mock.patch.object(StrataEngine, "PARK_DIR", self.dir.name):
+            eng.park_from_disk()
+            eng.unload()
+        self.assertEqual(self.commands(eng), ["PARKLOAD", "PARKSAVE", "CLOSE"])
 
     def test_an_engine_without_the_commands_is_not_asked(self):
         eng = FakeEngine(park_files=False)

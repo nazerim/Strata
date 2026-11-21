@@ -1227,8 +1227,8 @@ class StrataEngine:
                     except OSError:
                         pass
                 return
-        elif not os.path.exists(os.path.join(self.PARK_DIR, "park.manifest")):
-            return
+        # file mode: PARKLOAD is issued even with no park.manifest yet - the engine installs the spill and restore
+        # callbacks on that path too (it answers RESTORED 0 0 for a missing manifest), so a fresh park dir arms them
         try:
             r = self.session_file("parkload", self.PARK_DIR)
             where = f"RAM (keeper PID {keeper['pid']})" if keeper else self.PARK_DIR
